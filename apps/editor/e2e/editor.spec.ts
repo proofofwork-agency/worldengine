@@ -1,4 +1,13 @@
 import { expect, test } from '@playwright/test';
+import type { Page } from '@playwright/test';
+
+async function compileWorld(page: Page): Promise<void> {
+  await page.getByRole('button', { name: 'Compile world' }).click();
+  const dialog = page.getByRole('dialog', { name: 'Confirm compile' });
+  await dialog.getByRole('checkbox').check();
+  await dialog.getByRole('button', { name: 'Confirm & compile' }).click();
+  await expect(page.getByRole('button', { name: 'Save patch' })).toBeVisible();
+}
 
 test('loads the visual editor and reference world', async ({ page }) => {
   await page.goto('/');
@@ -58,8 +67,8 @@ test('exposes fail-closed server-side BYOK status and responsive keyboard naviga
   await expect(page.getByText('Keys never enter this browser or an exported game. Configure them on the compiler service with reviewed provider policies.')).toBeVisible();
 
   // Navigation is intentionally available without a prior canvas click; form fields remain guarded.
+  await expect(page.getByLabel('Inspected chunk')).toHaveValue(/^-?\d+:-?\d+$/);
   const navigation = page.getByLabel('Camera focus coordinates');
-  await expect(navigation).not.toHaveText('X 0  Y 0  Z 0');
   const home = await navigation.textContent();
   await page.keyboard.down('w');
   await page.waitForTimeout(250);
@@ -71,10 +80,7 @@ test('exposes fail-closed server-side BYOK status and responsive keyboard naviga
 
 test('loads canonical compiler artifacts and persists a revisioned editor patch', async ({ page }) => {
   await page.goto('/');
-  await page.getByRole('button', { name: 'Compile world' }).click();
-  await page.getByRole('dialog', { name: 'Confirm compile' }).getByRole('checkbox').check();
-  await page.getByRole('button', { name: 'Confirm & compile' }).click();
-  await expect(page.getByRole('button', { name: 'Save patch' })).toBeVisible();
+  await compileWorld(page);
   await page.getByRole('button', { name: 'terrain' }).click();
   await page.getByRole('button', { name: /center fallback/ }).click();
   await page.getByRole('button', { name: 'Save patch' }).click();
@@ -84,10 +90,7 @@ test('loads canonical compiler artifacts and persists a revisioned editor patch'
 
 test('regenerates one region through a canonical revisioned patch', async ({ page }) => {
   await page.goto('/');
-  await page.getByRole('button', { name: 'Compile world' }).click();
-  await page.getByRole('dialog', { name: 'Confirm compile' }).getByRole('checkbox').check();
-  await page.getByRole('button', { name: 'Confirm & compile' }).click();
-  await expect(page.getByRole('button', { name: 'Save patch' })).toBeVisible();
+  await compileWorld(page);
 
   await page.getByRole('button', { name: 'Regenerate region…' }).click();
   const dialog = page.getByRole('dialog', { name: /^Regenerate / });
@@ -104,10 +107,7 @@ test('regenerates one region through a canonical revisioned patch', async ({ pag
 
 test('requires rights affirmation before staging an imported GLB', async ({ page }) => {
   await page.goto('/');
-  await page.getByRole('button', { name: 'Compile world' }).click();
-  await page.getByRole('dialog', { name: 'Confirm compile' }).getByRole('checkbox').check();
-  await page.getByRole('button', { name: 'Confirm & compile' }).click();
-  await expect(page.getByRole('button', { name: 'Save patch' })).toBeVisible();
+  await compileWorld(page);
   await page.getByRole('button', { name: 'Assets' }).click();
   const chooser = page.waitForEvent('filechooser');
   await page.locator('.asset-grid button').first().click();

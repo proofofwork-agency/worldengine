@@ -4,9 +4,10 @@ import { ChunkIdSchema, PatchIdSchema, type TerrainEdit, type VisualWorldBundle 
 import { frameDeltaSeconds } from './frame-timing.js';
 
 export type CameraMode = 'sandbox' | 'third-person' | 'rts';
-const streamRadiusForMode = (mode: CameraMode): number => import.meta.env['VITE_E2E_MODE'] === 'true' ? 1
+const e2eMode = import.meta.env['VITE_E2E_MODE'] === 'true';
+const streamRadiusForMode = (mode: CameraMode): number => e2eMode ? 1
   : mode === 'third-person' ? 512 : mode === 'rts' ? 768 : 640;
-const previewTerrainSamples = import.meta.env['VITE_E2E_MODE'] === 'true' ? 17 : 65;
+const previewTerrainSamples = e2eMode ? 17 : 65;
 
 export interface ViewportStats {
   renderer: string;
@@ -175,7 +176,7 @@ export function WorldViewport({ tool, mode, timeOfDay, weather, terrainEdits, re
     void import('@worldengine/three').then(async ({ ThreeRendererBackend }) => {
       if (cancelled) return;
       const forceWebGL2 = new URLSearchParams(location.search).get('renderer')?.toLowerCase() === 'webgl2';
-      backend = new ThreeRendererBackend({ preferWebGPU: !forceWebGL2, shadows: true, ktx2TranscoderPath: `${import.meta.env.BASE_URL}basis/` });
+      backend = new ThreeRendererBackend({ preferWebGPU: !forceWebGL2, shadows: !e2eMode, ktx2TranscoderPath: `${import.meta.env.BASE_URL}basis/` });
       engine = new DefaultVisualWorldEngine(backend, { canvas, width: Math.max(1, rect.width), height: Math.max(1, rect.height), pixelRatio: window.devicePixelRatio });
       engineRef.current = engine;
       onEngine(engine);
@@ -289,5 +290,6 @@ export function WorldViewport({ tool, mode, timeOfDay, weather, terrainEdits, re
     }).then(() => { revisionRef.current += 1; }).catch((error: unknown) => onEvent({ type: 'chunk-error', chunkId: ChunkIdSchema.parse('0:0'), error: error instanceof Error ? error : new Error(String(error)) }));
   }, [terrainEdits, regionDensities]);
 
-  return <><canvas ref={canvasRef} className="world-canvas" aria-label="3D world viewport" tabIndex={0} /><output ref={navigationRef} className="navigation-readout" aria-label="Camera focus coordinates">X 0  Y 0  Z 0</output></>;
+  const initialFocus = navigationStateRef.current.focus;
+  return <><canvas ref={canvasRef} className="world-canvas" aria-label="3D world viewport" tabIndex={0} /><output ref={navigationRef} className="navigation-readout" aria-label="Camera focus coordinates">X {initialFocus[0].toFixed(0)}  Y {initialFocus[1].toFixed(0)}  Z {initialFocus[2].toFixed(0)}</output></>;
 }

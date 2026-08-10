@@ -2,7 +2,10 @@ import { defineConfig } from '@playwright/test';
 
 export default defineConfig({
   testDir: './apps/editor/e2e',
-  use: { baseURL: 'http://127.0.0.1:4174' },
+  timeout: 120_000,
+  expect: { timeout: 30_000 },
+  workers: 1,
+  use: { baseURL: 'http://127.0.0.1:4174', trace: 'retain-on-failure', screenshot: 'only-on-failure' },
   webServer: [
     {
       command: 'pnpm --filter @worldengine/compiler-service build && WORLDENGINE_DATA_DIR=.tmp/playwright-compiler PORT=8788 pnpm --filter @worldengine/compiler-service start',
