@@ -1,0 +1,30 @@
+{
+  "name": "@worldengine/compiler-service",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsx watch src/main.ts",
+    "dev:configured": "node --env-file=.env.local --import tsx src/main.ts",
+    "start": "node dist/main.js",
+    "start:configured": "node --env-file=.env.local dist/main.js",
+    "reference:build": "tsx src/reference-build.ts",
+    "provider:check": "tsx src/provider-policy-check.ts",
+    "test:providers:live": "tsx src/live-provider-smoke.ts"
+  },
+  "dependencies": {
+    "@worldengine/compiler": "workspace:*",
+    "@worldengine/schema": "workspace:*",
+    "@worldengine/terrain": "workspace:*"
+  },
+  "devDependencies": {
+    "@gltf-transform/core": "^4.4.2",
+    "@gltf-transform/extensions": "^4.4.2",
+    "@types/node": "^22.0.0",
+    "sharp": "0.35.3",
+    "tsx": "^4.0.0"
+  }
+}

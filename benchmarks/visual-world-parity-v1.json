@@ -1,0 +1,26 @@
+{
+  "id": "visual-world-parity-v1",
+  "referenceBaseline": "WorldClaw-paper-figures-4-8",
+  "evaluatorProtocol": "blinded-side-by-side-v1",
+  "targetScore": 90,
+  "minimumDimensionScore": 80,
+  "minimumRaters": 3,
+  "minimumAgreement": 0.67,
+  "dimensions": {
+    "composition-style": 0.30,
+    "asset-reconstruction": 0.20,
+    "terrain-coherence": 0.15,
+    "placement-contact": 0.10,
+    "editability-provenance": 0.10,
+    "runtime-quality-performance": 0.10,
+    "reliability-cost-reproducibility": 0.05
+  },
+  "requiredHardGates": ["provider-policy", "all-assets-reviewed", "terrain-contact", "free-viewpoint", "runtime-performance", "cost-cap", "independent-raters"],
+  "scenarios": [
+    { "id": "snow-future-valley", "prompt": "Create a snow-covered mountain valley with a frozen river, a research base in the north, and a small mining settlement near the eastern mountains." },
+    { "id": "tropical-pirate-island", "prompt": "Create a tropical island that serves as a pirate stronghold, with irregular coastlines, docks, ships, settlements, and dense vegetation." },
+    { "id": "river-canyon-settlement", "prompt": "Create a river canyon world with tribal settlements, layered cliffs, bridges, vegetation, and open functional regions." },
+    { "id": "desert-battlefield", "prompt": "Create a desert battlefield with broad open areas, layered rocky landforms, defensive structures, vehicles, and sparse vegetation." },
+    { "id": "medieval-fantasy-valley", "prompt": "Create a medieval fantasy valley with a village, river, farms, forest, mountain transitions, and independently editable buildings and props." }
+  ]
+}

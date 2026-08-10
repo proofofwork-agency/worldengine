@@ -1,0 +1,21 @@
+{
+  "name": "@worldengine/terrain",
+  "version": "0.1.0",
+  "description": "Deterministic seam-safe terrain and reference-world generation",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "node ../../scripts/build-package.mjs",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@worldengine/schema": "workspace:*"
+  }
+}

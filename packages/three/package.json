@@ -1,0 +1,27 @@
+{
+  "name": "@worldengine/three",
+  "version": "0.1.0",
+  "description": "Three.js renderer backend for WorldEngine",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "node ../../scripts/build-package.mjs",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@worldengine/runtime": "workspace:*",
+    "@worldengine/schema": "workspace:*",
+    "three": "^0.179.0"
+  },
+  "devDependencies": {
+    "@worldengine/terrain": "workspace:*",
+    "@types/three": "^0.179.0"
+  }
+}

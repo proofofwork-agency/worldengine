@@ -1,0 +1,36 @@
+{
+  "name": "@worldengine/compiler",
+  "version": "0.1.0",
+  "description": "Deterministic world compiler pipeline, storage, cost, and legal gates",
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "scripts": {
+    "build": "node ../../scripts/build-package.mjs",
+    "check": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "@gltf-transform/core": "^4.4.2",
+    "@gltf-transform/extensions": "^4.4.2",
+    "@gltf-transform/functions": "^4.4.2",
+    "@worldengine/schema": "workspace:*",
+    "@worldengine/terrain": "workspace:*",
+    "ktx-parse": "1.1.0",
+    "ktx2-encoder": "0.6.0",
+    "meshoptimizer": "^1.2.0",
+    "sharp": "0.35.3",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}

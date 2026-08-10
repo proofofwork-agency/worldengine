@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".",
+    "types": ["node"]
+  },
+  "include": [
+    "packages/**/*.test.ts",
+    "apps/**/*.test.ts",
+    "apps/**/e2e/**/*.ts",
+    "playwright.config.ts",
+    "vitest.config.ts"
+  ]
+}

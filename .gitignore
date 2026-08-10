@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+.tmp/
+tmp/
+playwright-report/
+test-results/
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
+!.env.example
+.worldengine/
+.contextrelay/
+apps/compiler-service/data/
