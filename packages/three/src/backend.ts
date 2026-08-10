@@ -239,8 +239,9 @@ export class ThreeRendererBackend implements RendererBackend {
       if (!prototype) throw new Error(`Unknown prototype ${prototypeId}`);
       const animated = !prototype.assetUri.startsWith('primitive://') && prototype.animationClips.length > 0 ? await this.loadAnimatedAsset(prototype.assetUri, prototype.contentHash) : undefined;
       if (animated) {
-        const taskStarted = performance.now();
-        instances.forEach((instance, index) => {
+        let taskStarted = performance.now();
+        for (let index = 0; index < instances.length; index += 1) {
+          const instance = instances[index]!;
           const object = cloneSkeleton(animated.scene);
           object.name = `animated:${prototypeId}:${instance.id}`;
           object.traverse((child) => {
@@ -258,7 +259,12 @@ export class ThreeRendererBackend implements RendererBackend {
           pendingEntities.push([instance.id, binding]);
           group.add(object);
           this.applyEntityAppearance(binding);
-        });
+          if ((index + 1) % 512 === 0 && index + 1 < instances.length) {
+            this.recordChunkTask(taskStarted);
+            await this.yieldChunkTask();
+            taskStarted = performance.now();
+          }
+        }
         this.recordChunkTask(taskStarted);
         return;
       }
@@ -268,7 +274,7 @@ export class ThreeRendererBackend implements RendererBackend {
         chunkVisualKeys.push(key);
       }
       const loaded = await Promise.all(variants.map((variant) => this.loadVisual(prototypeId, variant.assetUri, variant.contentHash)));
-      const taskStarted = performance.now();
+      let taskStarted = performance.now();
       const baseParts = loaded[0]!.parts;
       const meshVariants = loaded.map((visual, variantIndex) => visual.parts.map((part, partIndex) => {
         const inherited = variantIndex === 0 ? part.material : (baseParts[partIndex]?.material ?? baseParts[0]!.material);
@@ -285,13 +291,19 @@ export class ThreeRendererBackend implements RendererBackend {
         return mesh;
       }));
       const meshes = meshVariants.flat();
-      instances.forEach((instance, index) => {
+      for (let index = 0; index < instances.length; index += 1) {
+        const instance = instances[index]!;
         const matrix = new THREE.Matrix4().fromArray(instance.matrix);
         const color = new THREE.Color(0xffffff);
         const binding: EntityBinding = { meshes, objects: [], mixers: [], clips: [], index, prototypeId, originalMatrix: matrix.clone(), color, state: { ...instance.visualState } };
         pendingEntities.push([instance.id, binding]);
         this.applyEntityAppearance(binding);
-      });
+        if ((index + 1) % 512 === 0 && index + 1 < instances.length) {
+          this.recordChunkTask(taskStarted);
+          await this.yieldChunkTask();
+          taskStarted = performance.now();
+        }
+      }
       for (const mesh of meshes) {
         mesh.instanceMatrix.needsUpdate = true;
         if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
