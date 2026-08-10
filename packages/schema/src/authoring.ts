@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { ProvenanceRecordSchema } from './provenance.js';
-import { WorldFeatureSpecSchema } from './design.js';
+import { CalibratedRegionalCameraSchema, TerrainMaterialSetSchema, TerrainPlanSchema, WorldFeatureSpecSchema } from './design.js';
 import {
   Bounds2Schema,
   ChunkCoordinateSchema,
@@ -55,18 +55,33 @@ export const TerrainEditSchema = z.object({
   if ((edit.mode === 'flatten' || edit.mode === 'smooth') && edit.targetHeight === undefined) context.addIssue({ code: 'custom', path: ['targetHeight'], message: `${edit.mode} terrain edits require a target height` });
 });
 
-export const TerrainSourceSchema = z.object({
-  kind: z.enum(['procedural', 'heightmap', 'edited']),
+export const ProceduralTerrainSourceSchema = z.object({
+  kind: z.literal('procedural'),
   seed: z.number().int().nonnegative(),
   amplitude: z.number().nonnegative(),
   frequency: z.number().positive(),
-  heightmapUri: z.string().optional(),
   edits: z.array(TerrainEditSchema).default([]),
 });
 
+export const CompiledHeightfieldTerrainSourceSchema = z.object({
+  kind: z.literal('compiled-heightfield'),
+  seed: z.number().int().nonnegative(),
+  heightfieldUri: z.string().min(1),
+  contentHash: z.string().regex(/^[a-f\d]{64}$/i),
+  samples: z.number().int().min(3),
+  encoding: z.literal('float32'),
+  terrainPlan: TerrainPlanSchema,
+  materialSets: z.array(TerrainMaterialSetSchema).min(1),
+  splatMapUris: z.array(z.string().min(1)).min(1),
+  edits: z.array(TerrainEditSchema).default([]),
+  footprintEdits: z.array(z.object({ footprint: z.array(Vec2Schema).min(3), targetHeight: z.number(), mode: z.enum(['raise', 'lower', 'flatten', 'smooth']).default('flatten'), supportMarginMeters: z.literal(2), falloffEndMeters: z.literal(5) })).default([]),
+});
+
+export const TerrainSourceSchema = z.discriminatedUnion('kind', [ProceduralTerrainSourceSchema, CompiledHeightfieldTerrainSourceSchema]);
+
 export const ReferenceImageSchema = z.object({
   id: z.string().min(1),
-  kind: z.enum(['terrain-reference', 'region-concept', 'object-isolated', 'object-mask', 'object-multiview', 'object-diagnostic', 'placement-diagnostic', 'blender-rgb', 'blender-depth', 'blender-normal', 'blender-instance', 'quality-evidence']),
+  kind: z.enum(['terrain-reference', 'region-concept', 'object-isolated', 'object-crop', 'object-mask', 'object-multiview', 'object-diagnostic', 'placement-diagnostic', 'blender-rgb', 'blender-depth', 'blender-normal', 'blender-semantic', 'blender-instance', 'quality-evidence']),
   uri: z.string().min(1),
   contentHash: z.string().regex(/^[a-f\d]{64}$/i),
   contentType: z.enum(['image/png', 'image/jpeg', 'image/webp']),
@@ -76,7 +91,7 @@ export const ReferenceImageSchema = z.object({
   provenanceId: z.string().min(1),
 }).superRefine((reference, context) => {
   if ((reference.kind === 'terrain-reference' || reference.kind === 'region-concept') && !reference.regionId) context.addIssue({ code: 'custom', path: ['regionId'], message: 'Terrain and region references require a region ID' });
-  if (['object-isolated', 'object-mask', 'object-multiview', 'object-diagnostic'].includes(reference.kind) && !reference.prototypeId) context.addIssue({ code: 'custom', path: ['prototypeId'], message: 'Object references require a prototype ID' });
+  if (['object-isolated', 'object-crop', 'object-mask', 'object-multiview', 'object-diagnostic'].includes(reference.kind) && !reference.prototypeId) context.addIssue({ code: 'custom', path: ['prototypeId'], message: 'Object references require a prototype ID' });
   if (reference.kind === 'quality-evidence' && !reference.benchmarkScenarioId) context.addIssue({ code: 'custom', path: ['benchmarkScenarioId'], message: 'Quality evidence requires a benchmark scenario ID' });
   if (reference.kind !== 'quality-evidence' && reference.benchmarkScenarioId) context.addIssue({ code: 'custom', path: ['benchmarkScenarioId'], message: 'Only quality evidence may identify a benchmark scenario' });
 });
@@ -102,7 +117,13 @@ export const RegionalCompositionSchema = z.object({
     desiredHeightMeters: z.number().positive(),
     tags: z.array(z.string()).default([]),
     entityId: EntityIdSchema.optional(),
+    cropTransform: z.object({
+      compositionToCrop: z.tuple([z.number(), z.number(), z.number(), z.number(), z.number(), z.number()]),
+      cropToComposition: z.tuple([z.number(), z.number(), z.number(), z.number(), z.number(), z.number()]),
+      sourceBox: z.object({ x: z.number(), y: z.number(), width: z.number().positive(), height: z.number().positive() }),
+    }).optional(),
   })).min(1),
+  calibratedCamera: CalibratedRegionalCameraSchema.optional(),
 });
 
 export const AuthoringWorldSchema = z.object({

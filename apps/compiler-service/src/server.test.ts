@@ -10,7 +10,7 @@ import { persistCanonicalSnapshot, persistStagedArtifacts, startCompilerService,
 import { JobLedger } from './ledger.js';
 import { CompileRequestSchema, QUALITY_DIMENSION_WEIGHTS, WorldDesignSpecSchema, type ProviderRole, type ProviderTermsProfile, type QualityDimension } from '@worldengine/schema';
 import { compileLocalWorldArtifacts, createQualityCertification, FileBinaryArtifactStore, FileWorldStorage, PAPER_DERIVED_BENCHMARK_SCENARIOS, ProviderExecutionRegistry, validateKtx2, type JsonPlanningInput, type ProviderAdapter, type ProviderInvocation, type WorldStorage } from '@worldengine/compiler';
-import { createReferenceDesignSpec } from '@worldengine/terrain';
+import { createReferenceDesignSpec, REFERENCE_SCATTER_INSTANCES_PER_CHUNK } from '@worldengine/terrain';
 
 let service: RunningCompilerService | undefined;
 let directory: string | undefined;
@@ -143,12 +143,20 @@ describe('compiler HTTP service', () => {
     const glb = await binary.put(fixtureGlb(), 'model/gltf-binary');
     const pngBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
     const png = await binary.put(pngBytes, 'image/png');
+    const heightfieldBytes = new Uint8Array(new Float32Array([0, 1, 2, 3]).buffer);
+    const heightfield = await binary.put(heightfieldBytes, 'application/octet-stream');
+    const ktx2Bytes = new Uint8Array([0xab, 0x4b, 0x54, 0x58, 0x20, 0x32, 0x30, 0xbb, 0x0d, 0x0a, 0x1a, 0x0a]);
+    const ktx2 = await binary.put(ktx2Bytes, 'image/ktx2');
     await persistStagedArtifacts('staged-world', [
       { ...glb, uri: `assets/${glb.contentHash}.glb` },
       { ...png, uri: `references/${png.contentHash}.png` },
+      { ...heightfield, uri: `terrain/${heightfield.contentHash}.f32` },
+      { ...ktx2, uri: `terrain/${ktx2.contentHash}.ktx2` },
     ], binary, worlds);
     expect(await worlds.getAsset('staged-world', glb.contentHash)).toEqual(fixtureGlb());
     expect(await worlds.getReference('staged-world', png.contentHash, 'png')).toEqual(pngBytes);
+    expect(await worlds.getTerrain('staged-world', heightfield.contentHash, 'f32')).toEqual(heightfieldBytes);
+    expect(await worlds.getTerrain('staged-world', ktx2.contentHash, 'ktx2')).toEqual(ktx2Bytes);
     await expect(persistStagedArtifacts('staged-world', [{ ...png, uri: '../escape.png' }], binary, worlds)).rejects.toThrow('unsupported artifact URI');
   });
 
@@ -176,10 +184,18 @@ describe('compiler HTTP service', () => {
     const authoring = await fetch(`${service.origin}/v1/worlds/world-${compileId}/authoring`).then((result) => result.json()) as { format: string; entities: unknown[]; revision: number };
     expect(design).toMatchObject({ format: 'WorldDesignSpec', regions: expect.any(Array) });
     expect(authoring).toMatchObject({ format: 'AuthoringWorld', revision: 0 });
-    expect(authoring.entities).toHaveLength(5_140);
+    expect(authoring.entities).toHaveLength(REFERENCE_SCATTER_INSTANCES_PER_CHUNK * 256 + 20);
     const jobs = await fetch(`${service.origin}/v1/compiles`).then((result) => result.json()) as { jobs: Array<{ id: string; status: string }> };
     expect(jobs.jobs).toContainEqual(expect.objectContaining({ id: compileId, status: 'completed' }));
     const job = await fetch(`${service.origin}/v1/compiles/${compileId}`).then((result) => result.json()) as { events: Array<{ sequence: number; type: string }> };
+    const artifactCatalog = await fetch(`${service.origin}/v1/compiles/${compileId}/artifacts`);
+    expect(artifactCatalog.status).toBe(200);
+    expect(await artifactCatalog.json()).toMatchObject({ compileId, artifacts: expect.any(Array), attempts: expect.any(Array), decisions: [] });
+    const compileReport = await fetch(`${service.origin}/v1/compiles/${compileId}/report`);
+    expect(compileReport.status).toBe(200);
+    expect(await compileReport.json()).toMatchObject({ compileId, status: 'published', qualityProfile: 'local', cost: { capUsd: 0 } });
+    expect((await fetch(`${service.origin}/v1/compiles/${compileId}/artifacts/missing`)).status).toBe(404);
+    expect((await fetch(`${service.origin}/v1/compiles/${compileId}/resume`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ maxCostUsd: 1, confirmed: true }) })).status).toBe(409);
     const terminalSequence = job.events.find((event) => event.type === 'completed')!.sequence;
     const resumed = await fetch(`${service.origin}/v1/compiles/${compileId}/events`, { headers: { 'last-event-id': String(terminalSequence) } });
     expect(await resumed.text()).toBe('');
@@ -196,20 +212,21 @@ describe('compiler HTTP service', () => {
     const proofBytes = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
     const proofHash = createHash('sha256').update(proofBytes).digest('hex');
     await storage.putReference(artifact.bundle.worldId, proofHash, 'png', proofBytes, 'image/png');
-    const proofKinds = ['region-concept', 'object-mask', 'object-multiview', 'blender-rgb', 'blender-depth', 'blender-normal', 'blender-instance', 'placement-diagnostic'] as const;
+    const proofKinds = ['region-concept', 'object-mask', 'object-crop', 'object-multiview', 'blender-rgb', 'blender-depth', 'blender-normal', 'blender-semantic', 'blender-instance', 'placement-diagnostic'] as const;
     const prototypeId = artifact.authoringWorld.prototypes[0]!.id; const regionId = artifact.designSpec.regions[0]!.id;
-    const proofReferences = proofKinds.map((kind) => ({ id: `proof-${kind}`, kind, uri: `references/${proofHash}.png`, contentHash: proofHash, contentType: 'image/png' as const, ...(kind === 'region-concept' ? { regionId } : {}), ...(['object-mask', 'object-multiview'].includes(kind) ? { prototypeId } : {}), ...(['blender-rgb', 'blender-depth', 'blender-normal', 'blender-instance'].includes(kind) ? { prototypeId } : {}), provenanceId: `provenance-proof-${kind}` }));
+    const proofReferences = proofKinds.map((kind) => ({ id: `proof-${kind}`, kind, uri: `references/${proofHash}.png`, contentHash: proofHash, contentType: 'image/png' as const, ...(kind === 'region-concept' ? { regionId } : {}), ...(['object-mask', 'object-crop', 'object-multiview'].includes(kind) ? { prototypeId } : {}), ...(['blender-rgb', 'blender-depth', 'blender-normal', 'blender-semantic', 'blender-instance'].includes(kind) ? { prototypeId } : {}), provenanceId: `provenance-proof-${kind}` }));
     const proofProvenance = proofKinds.map((kind) => ({ id: `provenance-proof-${kind}`, subjectId: `proof-${kind}`, kind: 'edited' as const, sourceUri: `references/${proofHash}.png`, license: { name: 'fixture evidence', commercialUse: true }, createdAt: '2026-08-10T00:00:00.000Z', contentHash: proofHash, parentIds: [], reviewedAt: '2026-08-10T00:00:00.000Z' }));
     artifact.authoringWorld.referenceImages.push(...proofReferences);
     artifact.authoringWorld.provenance.push(...proofProvenance); artifact.bundle.provenance.push(...proofProvenance);
     const detected = artifact.authoringWorld.entities.find((entity) => entity.visualState['compositionPlaced'] === true)!;
     detected.visualState = { ...detected.visualState, compositionDetected: true, coDeformed: true };
+    if (artifact.authoringWorld.terrain.kind === 'compiled-heightfield') artifact.authoringWorld.terrain.footprintEdits.push({ footprint: [[-2, -2], [2, -2], [2, 2], [-2, 2]], targetHeight: 0, mode: 'flatten', supportMarginMeters: 2, falloffEndMeters: 5 });
     await persistCanonicalSnapshot(storage, artifact.bundle, artifact.designSpec, artifact.authoringWorld);
     const profiles = [
       { ...acceptedPlanningProfile(), provider: 'openrouter', modelId: 'planning-review' },
-      { ...acceptedPlanningProfile(), provider: 'openai', modelId: 'image' },
+      { ...acceptedPlanningProfile(), provider: 'openrouter-image', modelId: 'openai/gpt-image-2' },
       { ...acceptedPlanningProfile(), provider: 'sam2-local', modelId: 'sam2' },
-      { ...acceptedPlanningProfile(), provider: 'tripo', modelId: 'multiview' },
+      { ...acceptedPlanningProfile(), provider: 'wavespeed', modelId: 'tripo3d/h3.1/multiview-to-3d' },
     ];
     service = await startCompilerService({ dataDirectory: directory, worldStorage: storage, providerProfiles: profiles });
     const scenarioEvidence = new Map<string, string>();
@@ -227,7 +244,7 @@ describe('compiler HTTP service', () => {
       hardGates: ['provider-policy', 'all-assets-reviewed', 'terrain-contact', 'free-viewpoint', 'runtime-performance', 'cost-cap', 'independent-raters'].map((id) => ({ id, passed: true, message: `${id} passed`, evidenceIds: [evidenceId] })),
       scenarios: PAPER_DERIVED_BENCHMARK_SCENARIOS.map((scenario) => ({ id: scenario.id, score: 91, evidenceIds: [scenarioEvidence.get(scenario.id)!] })),
       raterCount: 3, raterAgreement: 0.82, evidenceIds: [evidenceId], actualCostUsd: 84, durationMs: 2_000,
-      providers: [provider('planner', 'openrouter'), provider('reviewer', 'openrouter'), provider('object-detection', 'openrouter'), provider('composition-image', 'openai'), provider('multiview-image', 'openai'), provider('segmentation', 'sam2-local'), provider('image-to-3d', 'tripo')],
+      providers: [provider('planner', 'openrouter'), provider('reviewer', 'openrouter'), provider('object-detection', 'openrouter'), provider('composition-image', 'openrouter-image'), provider('multiview-image', 'openrouter-image'), provider('segmentation', 'sam2-local'), provider('image-to-3d', 'wavespeed')],
     });
     const published = await fetch(`${service.origin}/v1/worlds/${artifact.bundle.worldId}/certifications`, { method: 'POST', headers: { 'content-type': 'application/json', 'x-worldengine-certification-affirmed': 'true' }, body: JSON.stringify(certification) });
     expect(published.status).toBe(201);
@@ -248,6 +265,39 @@ describe('compiler HTTP service', () => {
     const recovered = await fetch(`${service.origin}/v1/compiles/interrupted`).then((response) => response.json()) as { status: string; events: Array<{ type: string }> };
     expect(recovered.status).toBe('completed');
     expect(recovered.events).toEqual(expect.arrayContaining([expect.objectContaining({ type: 'completed' })]));
+  });
+
+  it('persists a typed repair decision while resetting only resumable DAG checkpoints', async () => {
+    directory = await mkdtemp(join(tmpdir(), 'worldengine-decision-'));
+    const ledger = new JobLedger(join(directory, 'jobs.sqlite'));
+    const request = CompileRequestSchema.parse({ prompt: 'repair me', seed: 4, maxCostUsd: 0, maxAssetGenerations: 0, territory: 'NL', commercialUse: false, dryRun: true });
+    ledger.createJob('attention', request);
+    await ledger.save('attention', { id: 'requirements', status: 'completed', output: { failure: 'camera drift' }, completedAt: '2026-08-10T00:00:00.000Z' });
+    ledger.appendEvent({ sequence: 0, compileId: 'attention', type: 'needs-attention', phase: 'region-map', progress: 1, message: 'camera drift', timestamp: '2026-08-10T00:00:01.000Z', data: {} });
+    expect(ledger.decisions('attention')).toEqual([expect.objectContaining({ approved: false, diagnosis: [expect.objectContaining({ code: 'composition-drift' })], actions: [expect.objectContaining({ type: 'regenerate-composition' })] })]);
+    expect(ledger.attempts('attention')[0]?.plannedAction?.type).toBe('regenerate-composition');
+    expect(ledger.nodeOutput('attention', 'requirements')).toBeDefined();
+    ledger.resetDag('attention');
+    expect(ledger.nodeOutput('attention', 'requirements')).toBeUndefined();
+    expect(ledger.decisions('attention')).toHaveLength(1);
+    ledger.createJob('silhouette-attention', request);
+    ledger.appendEvent({ sequence: 0, compileId: 'silhouette-attention', type: 'needs-attention', phase: 'region-refinement', progress: 1, message: 'Blender region refinement failed silhouette thresholds', timestamp: '2026-08-10T00:00:02.000Z', data: {} });
+    expect(ledger.decisions('silhouette-attention')[0]).toMatchObject({ diagnosis: [{ code: 'silhouette-mismatch' }], actions: [{ type: 'reconstruct-mesh' }] });
+    ledger.close();
+  });
+
+  it('persists provider-priced generation attempts from compile cost accounting', async () => {
+    directory = await mkdtemp(join(tmpdir(), 'worldengine-provider-costs-'));
+    const ledger = new JobLedger(join(directory, 'jobs.sqlite'));
+    const request = CompileRequestSchema.parse({ prompt: 'account this provider action', seed: 8, maxCostUsd: 1, maxAssetGenerations: 0, territory: 'NL', commercialUse: false, dryRun: true });
+    ledger.createJob('accounted', request);
+    ledger.appendEvent({
+      sequence: 0, compileId: 'accounted', type: 'cost', phase: 'cost-accounting', progress: 0.945,
+      message: 'Provider attempts accounted against the confirmed cap', timestamp: '2026-08-10T00:00:01.000Z',
+      data: { reservedCostUsd: 0.25, actualCostUsd: 0.25, providerAttempts: [{ id: 'provider-attempt-1', compileId: 'accounted', phase: 'composition', index: 0, status: 'passed', provider: 'openrouter-image', modelId: 'openai/gpt-image-2', revision: 'r1', reservedCostUsd: 0.25, actualCostUsd: 0.25, artifactIds: [], startedAt: '2026-08-10T00:00:00.000Z', completedAt: '2026-08-10T00:00:01.000Z' }] },
+    });
+    expect(ledger.attempts('accounted')).toEqual([expect.objectContaining({ id: 'provider-attempt-1', phase: 'composition', provider: 'openrouter-image', modelId: 'openai/gpt-image-2', revision: 'r1', reservedCostUsd: 0.25, actualCostUsd: 0.25 })]);
+    ledger.close();
   });
 
   it('rejects malformed requests without persisting secrets', async () => {

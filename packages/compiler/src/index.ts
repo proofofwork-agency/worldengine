@@ -7,6 +7,7 @@ export * from './asset-diagnostic.js';
 export * from './asset-validation.js';
 export * from './asset-optimizer.js';
 export * from './composition.js';
+export * from './composition-artifacts.js';
 export * from './dag.js';
 export * from './http-adapters.js';
 export * from './legal.js';

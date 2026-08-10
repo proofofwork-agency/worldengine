@@ -14,15 +14,15 @@ Consequently, sharing a pipeline shape does not guarantee equal visual output. A
 | --- | --- | --- |
 | Intent analysis and scene planning | Zod-validated `WorldDesignSpec`; local deterministic planner or pinned structured-output planner | Implemented and contract-tested |
 | Semantic layout and region masks | Canonical vector polygons, deterministic masks and soft terrain blending | Implemented and deterministic |
-| Region-aware height field and scattering | Seeded landform operators, features, biome weights, slope/contact-aware scatter | Implemented; not the paper's generated Blender terrain program |
-| Terrain materials | Local PBR tiled channels and KTX2 optimization; imported/generated asset materials | Implemented baseline; procedural Blender node authoring remains a quality gap |
-| Terrain-conditioned composition | Exact known camera, canonical terrain RGB input, image editing, recorded composition | Implemented; live quality depends on enabled image model |
-| Actual object extraction | Structured multimodal detection from the actual composition, then local SAM2 box mask | Studio implemented; alternative to restricted SAM3 |
-| Independent 3D reconstruction | Four ordered cardinal views through a direct Tripo or Meshy PBR adapter, with a fifth perspective reference retained for review; Cheap uses WaveSpeed Tripo | Studio implemented; provider bake-off is still manual |
-| Placement | Reverse known camera projection, terrain raycast, scale/contact correction and placement atlas | Implemented deterministically |
-| Object refinement | Fixed Blender 5.1 asset repair, normalized origin/material/normals/contact, turntable and passes | Implemented as an allowlisted worker; no arbitrary generated Python |
-| Terrain co-deformation | Local renderer-neutral flatten/smooth height-field support edits around the placed footprint | Implemented deterministic alternative; not Blender mesh sculpting |
-| Render-inspect-repair | Persisted exact-asset and placement evidence, structured multimodal approval, bounded policy fields | Publication gate implemented; automatic provider regeneration after a failed asset remains deliberately fail-closed |
+| Region-aware height field and scattering | Soft region masks plus ridge/peak/dune/terrace/erosion/riverbed/plateau operators, material splats and conditioned scatter recipes | Contract/deterministic tests pass; live Blender terrain quality unproven |
+| Terrain materials | Standalone Basis/UASTC KTX2 dependencies for Three.js plus fixed Blender triplanar base-color/normal/roughness/macrovariation nodes | Implemented and contract-tested; generated live material quality unproven |
+| Terrain-conditioned composition | Registered terrain RGB plus depth/semantic context, reference editing and 0.90/0.95/8 px preservation gates | Mocked contracts pass; live image quality unproven |
+| Actual object extraction | Structured detection from the composition, SAM2.1 Hiera Large mask, lossless alpha crop and invertible affine | Contract-tested; local full-checkpoint run still required |
+| Independent 3D reconstruction | Four ordered cardinal views through WaveSpeed `tripo3d/h3.1/multiview-to-3d`, detailed PBR triangle output | Mocked fail-closed contract passes; no paid quality evidence yet |
+| Placement | Calibrated camera projection, real imported-mesh scale/yaw fitting, SAM-mask silhouette IoU/center gates, contact gates and placement atlas | Worker contract and deterministic math are tested; target-machine Blender evidence pending |
+| Object refinement | Fixed Blender 5.1 mesh/region jobs, origin/material/normal/contact correction and five render passes | Worker contract implemented; target-machine headless acceptance pending |
+| Terrain co-deformation | Raise/lower/flatten/smooth from the real mesh footprint, full falloff by 5 m and seam-preserving world coordinates | Deterministic bounds tested; live scene result pending |
+| Render-inspect-repair | Permanent artifact catalog, typed diagnoses, bounded composition/asset/scene attempts and resumable `needs-attention` runs | Control flow implemented; live repair convergence unproven |
 | Explicit editable world | Stable entities/prototypes, independent GLBs, patches, terrain edits, provenance and immutable versions | Implemented |
 | Free-viewpoint game-engine path | Renderer-neutral streaming runtime and Three.js WebGPU/WebGL2 adapter | Implemented and browser-tested locally |
 
@@ -30,15 +30,15 @@ Consequently, sharing a pipeline shape does not guarantee equal visual output. A
 
 | Profile | Maximum | Intended result | Required execution |
 | --- | ---: | --- | --- |
-| Local | $0 | Coherent explorable world with procedural PBR placeholders | No provider or Blender |
-| Cheap | $15/world | One visually enriched hero region and up to five generated assets | OpenRouter, OpenAI image, WaveSpeed Tripo |
-| Studio | $100/world | Up to five hero regions, actual masks, multiview PBR assets, Blender diagnostics and terrain support fitting | OpenRouter, OpenAI image, local SAM2, Blender 5.1, direct Tripo **or** Meshy |
+| Local draft | $0 | Coherent explorable draft with clearly marked procedural placeholders | No provider or Blender |
+| Cheap | $15/world | One visually enriched hero region and up to five generated assets | OpenRouter planning + OpenRouter Images, WaveSpeed Tripo |
+| Studio · experimental | First $25/hero; later separate $100/world | One hero gate first; only after success up to five regions | OpenRouter `openai/gpt-5.6-terra` + `openai/gpt-image-2`, local SAM2.1 Large, WaveSpeed H3.1 multiview, Blender 5.1 |
 
-No profile automatically spends its maximum. The policy estimate must fit the request cap, and the user confirms the displayed bound before execution.
+No profile automatically spends its maximum. The policy estimate plus prior resume spend must fit the request cap, the user confirms the displayed bound before execution, and every unique provider action reserves its reviewed unit price before the adapter is invoked. The durable report uses that policy price conservatively when the provider does not expose invoice data.
 
-## Tripo versus Meshy
+## Fixed reconstruction route
 
-WorldEngine does not silently fall back between providers. Studio exposes a deliberate bake-off choice. Run the same isolated/multiview references, face limit, texture target, seed class and benchmark scenarios through each reviewed adapter. The adapters follow the current [Tripo multiview task contract](https://platform.tripo3d.ai/docs/generation) and [Meshy multi-image contract](https://docs.meshy.ai/en/api/multi-image-to-3d), while policy still pins the exact reviewed revision. Compare mesh silhouette and topology, view consistency, PBR texture fidelity, thin structures, Blender repair burden, failure rate, latency and actual cost. Pin the winner's exact revision in the certification. A provider marketing page is not evidence of superiority.
+Studio has one fail-closed route: WaveSpeed-hosted Tripo H3.1 multiview. No direct Tripo or Meshy credential, alias, fallback or bake-off is part of the Studio product path. The policy must pin the exact reviewed revision, terms fingerprint and unit cost. Provider marketing is not quality evidence; only the saved GLBs, calibrated renders, deterministic measurements and blinded evaluation count.
 
 ## The 90/100 protocol
 
@@ -62,9 +62,9 @@ This repository implements and tests that gate. It does **not** ship a fabricate
 
 - The paper used a stronger and restricted/different model stack plus four H20 GPUs; Studio uses legal/operator-reviewed substitutes.
 - SAM2 box prompting does not reproduce SAM3 sliding-window text detection; the preceding VLM detector supplies the boxes.
-- Tripo/Meshy multiview metadata differs from SAM3D's recovered reconstruction camera, so WorldEngine anchors placement from the known composition box and terrain camera rather than claiming Equation 10-13 equivalence.
+- WaveSpeed/Tripo multiview metadata differs from SAM3D's recovered reconstruction camera, so WorldEngine anchors placement from the known composition box and calibrated terrain camera rather than claiming Equation 10-13 equivalence.
 - WorldEngine's terrain support fitting is deterministic height-field editing, not free-form Blender mesh co-sculpting.
-- Procedural Blender shader-node authoring is not yet in the fixed worker.
+- The canonical pre-composition terrain pass does not yet include a separately reconstructed ecology kit; generated ecology is visible in the final refined-region passes.
 - WorldEngine deliberately rejects raw provider output unless multimodal review passes; mocked contracts prove control flow, not live visual quality.
 
 These are benchmarked differences, not hidden ones.

@@ -1,12 +1,16 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { createReferenceBundle, createReferenceDesignSpec } from '@worldengine/terrain';
+import { createReferenceBundle, createReferenceDesignSpec, REFERENCE_SCATTER_INSTANCES_PER_CHUNK } from '@worldengine/terrain';
 import {
   AssetLibraryEntrySchema,
   AuthoringWorldSchema,
+  CompileArtifactCatalogSchema,
+  CompileReportSchema,
   PatchIdSchema,
   VisualWorldBundleSchema,
   WorldDesignSpecSchema,
   type AuthoringWorld,
+  type CompileArtifactCatalog,
+  type CompileReport,
   type RuntimeInstance,
   type QualityProfile,
   type TerrainEdit,
@@ -16,6 +20,7 @@ import {
   type WorldPatchOperation,
 } from '@worldengine/schema';
 import { resolveBundleAssetUris, type VisualWorldEngine, type VisualWorldEvent } from '@worldengine/runtime';
+import { mountArtifactGlbViewer } from '@worldengine/three';
 import { Icon, icons } from './icons.js';
 import { RegionMap } from './RegionMap.js';
 import { WorldViewport, type CameraMode, type ViewportStats } from './WorldViewport.js';
@@ -38,6 +43,7 @@ interface EditorState {
 }
 interface EditorSnapshot { id: string; name: string; createdAt: string; state: EditorState }
 interface EditorJob { id: string; kind: 'compile' | 'regenerate' | 'expand'; status: string; createdAt: string; costUsd: number }
+interface CompileWorkspace { id: string; status: CompileReport['status']; catalog?: CompileArtifactCatalog; report?: CompileReport }
 interface PendingAssetImport { prototypeId: string; file: File; contentHash: string }
 interface LoadedChunkSummary {
   id: string;
@@ -125,6 +131,45 @@ function pointInPolygon(point: [number, number], polygon: Array<[number, number]
   return inside;
 }
 
+function ArtifactGlbPreview({ uri }: { uri: string }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const [error, setError] = useState<string>();
+  useEffect(() => {
+    if (!canvasRef.current) return;
+    setError(undefined);
+    const viewer = mountArtifactGlbViewer(canvasRef.current, uri, (cause) => setError(cause.message));
+    return () => viewer.dispose();
+  }, [uri]);
+  return <div className="artifact-glb-viewer"><canvas ref={canvasRef} aria-label="Interactive GLB artifact viewer" />{error && <p>{error}</p>}<small>Drag to orbit · scroll to zoom</small></div>;
+}
+
+function CompileArtifactWorkspace({ workspace, endpoint, onResume }: { workspace: CompileWorkspace; endpoint: string; onResume: (newCap: number) => Promise<void> }) {
+  const artifacts = workspace.catalog?.artifacts ?? [];
+  const attempts = workspace.catalog?.attempts ?? [];
+  const images = artifacts.filter((artifact) => artifact.contentType.startsWith('image/'));
+  const glbs = artifacts.filter((artifact) => artifact.contentType === 'model/gltf-binary');
+  const artifactUrl = (id: string) => `${endpoint}/v1/compiles/${encodeURIComponent(workspace.id)}/artifacts/${encodeURIComponent(id)}`;
+  const [selectedGlbId, setSelectedGlbId] = useState<string>();
+  const [comparison, setComparison] = useState(50);
+  const [resumeCap, setResumeCap] = useState(Math.min(100, Math.max(1, (workspace.report?.cost.capUsd ?? 0) + 5)));
+  const [resumeConfirmed, setResumeConfirmed] = useState(false);
+  const selectedGlb = glbs.find((artifact) => artifact.id === selectedGlbId) ?? glbs.at(-1);
+  const comparisonImages = [images.find((artifact) => artifact.kind === 'regional-composition') ?? images[0], images.find((artifact) => artifact.kind === 'threejs-render') ?? images.find((artifact) => artifact.kind === 'blender-rgb') ?? images[1]].filter((artifact, index, values) => artifact && values.indexOf(artifact) === index);
+  const rejected = [...attempts].reverse().find((attempt) => attempt.status === 'rejected' || attempt.status === 'failed');
+  const reason = workspace.report?.rejectionReason ?? rejected?.rejectionReason;
+  const action = workspace.report?.plannedAction ?? rejected?.plannedAction;
+  return <section className="compile-workspace" aria-label="Compile artifacts">
+    <header><div><small>CLOUD COMPILE</small><strong>{workspace.id.slice(0, 12)}</strong></div><span className={`compile-status ${workspace.status}`}>{workspace.status.replace('-', ' ')}</span></header>
+    <dl><div><dt>Reserved / actual</dt><dd>${(workspace.report?.cost.reservedUsd ?? 0).toFixed(2)} / ${(workspace.report?.cost.actualUsd ?? 0).toFixed(2)}</dd></div><div><dt>Artifacts / attempts</dt><dd>{artifacts.length} / {attempts.length}</dd></div></dl>
+    {reason && <div className="compile-diagnosis"><strong>Why it stopped</strong><p>{reason}</p>{action && <small>Planned repair: {action.type} · {action.reason}</small>}</div>}
+    {comparisonImages.length === 2 && <div className="artifact-comparison"><div><img src={artifactUrl(comparisonImages[0]!.id)} alt={comparisonImages[0]!.kind} /><img style={{ clipPath: `inset(0 ${100 - comparison}% 0 0)` }} src={artifactUrl(comparisonImages[1]!.id)} alt={comparisonImages[1]!.kind} /></div><input aria-label="Artifact comparison split" type="range" min="0" max="100" value={comparison} onChange={(event) => setComparison(Number(event.target.value))} /><small>{comparisonImages[0]!.kind} ↔ {comparisonImages[1]!.kind}</small></div>}
+    {selectedGlb && <ArtifactGlbPreview uri={artifactUrl(selectedGlb.id)} />}
+    <div className="artifact-grid">{artifacts.map((artifact) => <button key={artifact.id} className={selectedGlb?.id === artifact.id ? 'selected' : ''} onClick={() => artifact.contentType === 'model/gltf-binary' && setSelectedGlbId(artifact.id)} title={`${artifact.contentHash} · ${artifact.byteLength} bytes`}>{artifact.contentType.startsWith('image/') ? <img src={artifactUrl(artifact.id)} alt="" /> : <span>{artifact.contentType === 'model/gltf-binary' ? '3D' : 'DOC'}</span>}<strong>{artifact.kind}</strong><small>{artifact.phase}</small></button>)}</div>
+    {attempts.length > 0 && <ol className="attempt-list">{attempts.map((attempt) => <li key={attempt.id}><span>{attempt.phase} #{attempt.index + 1}</span><em>{attempt.status}</em><small>${attempt.actualCostUsd.toFixed(2)}{attempt.rejectionReason ? ` · ${attempt.rejectionReason}` : ''}</small></li>)}</ol>}
+    {workspace.status === 'needs-attention' && <div className="resume-compile"><label>New explicit cost cap<input type="number" min={(workspace.report?.cost.capUsd ?? 0) + 0.01} max="100" step="1" value={resumeCap} onChange={(event) => { setResumeCap(Number(event.target.value)); setResumeConfirmed(false); }} /></label><label><input type="checkbox" checked={resumeConfirmed} onChange={(event) => setResumeConfirmed(event.target.checked)} /> Confirm additional provider spend</label><button disabled={!resumeConfirmed || resumeCap <= (workspace.report?.cost.capUsd ?? 0)} onClick={() => void onResume(resumeCap)}>Resume run</button></div>}
+  </section>;
+}
+
 export function App() {
   const [bundle, setBundle] = useState<VisualWorldBundle>(referenceBundle);
   const [design, setDesign] = useState<WorldDesignSpec>(referenceDesign);
@@ -144,12 +189,12 @@ export function App() {
   const [compileLimitsConfirmed, setCompileLimitsConfirmed] = useState(false);
   const [qualityProfile, setQualityProfile] = useState<QualityProfile>('local');
   const [heroRegionIds, setHeroRegionIds] = useState<string[]>([]);
-  const [studio3dProvider, setStudio3dProvider] = useState<'tripo' | 'meshy'>('tripo');
   const [maxAssetGenerations, setMaxAssetGenerations] = useState(20);
   const [maxReferenceImages, setMaxReferenceImages] = useState(5);
   const [compilerHealth, setCompilerHealth] = useState<CompilerHealth>();
   const [snapshots, setSnapshots] = useState<EditorSnapshot[]>([]);
   const [jobs, setJobs] = useState<EditorJob[]>([]);
+  const [compileWorkspace, setCompileWorkspace] = useState<CompileWorkspace>();
   const [selectedAsset, setSelectedAsset] = useState<string>();
   const [pendingAsset, setPendingAsset] = useState<PendingAssetImport>();
   const [assetLicenseName, setAssetLicenseName] = useState('User-provided commercial license');
@@ -176,10 +221,14 @@ export function App() {
   const assetLicenseUrlValid = assetLicenseUrl.trim().length === 0 || URL.canParse(assetLicenseUrl.trim());
   const selectedChunk = loadedChunkSummaries.find((chunk) => chunk.id === selectedChunkId) ?? loadedChunkSummaries[0];
   const selectedChunkManifest = selectedChunk ? bundle.chunks.find((chunk) => chunk.id === selectedChunk.id) : undefined;
+  const estimatedLocalInstanceCount = bundle.chunks.length * REFERENCE_SCATTER_INSTANCES_PER_CHUNK
+    + bundle.authoredInstances.filter((instance) => !/^entity--?\d+--?\d+-0$/.test(instance.id)).length;
   const readyProviders = compilerHealth?.generation?.providers.filter((profile) => profile.operational && profile.configured) ?? [];
-  const cheapProviders = ['openrouter', 'openai', 'wavespeed'].map((provider) => readyProviders.find((profile) => profile.provider === provider)).filter((profile): profile is ProviderStatus => profile !== undefined);
-  const studioMeshProvider = readyProviders.find((profile) => profile.provider === studio3dProvider);
-  const studioProviders = [...['openrouter', 'openai', 'sam2-local'].map((provider) => readyProviders.find((profile) => profile.provider === provider)).filter((profile): profile is ProviderStatus => profile !== undefined), ...(studioMeshProvider ? [studioMeshProvider] : [])];
+  const planningProvider = readyProviders.find((profile) => profile.provider === 'openrouter');
+  const imageProvider = readyProviders.find((profile) => profile.provider === 'openrouter-image' && profile.modelId === 'openai/gpt-image-2');
+  const cheapProviders = [planningProvider, imageProvider, readyProviders.find((profile) => profile.provider === 'wavespeed' && profile.modelId !== 'tripo3d/h3.1/multiview-to-3d')].filter((profile): profile is ProviderStatus => profile !== undefined);
+  const studioMeshProvider = readyProviders.find((profile) => profile.provider === 'wavespeed' && profile.modelId === 'tripo3d/h3.1/multiview-to-3d');
+  const studioProviders = [planningProvider, imageProvider, readyProviders.find((profile) => profile.provider === 'sam2-local'), studioMeshProvider].filter((profile): profile is ProviderStatus => profile !== undefined);
   const selectedCloudProviders = qualityProfile === 'studio' ? studioProviders : cheapProviders;
   const cloudAvailable = qualityProfile === 'cheap' ? cheapProviders.length === 3 : qualityProfile === 'studio' ? studioProviders.length === 4 && compilerHealth?.generation?.qualityProfiles?.studio.available === true : true;
   const reusableAssetLibrary = useMemo(() => bundle.prototypes.flatMap((prototype) => {
@@ -207,12 +256,16 @@ export function App() {
       rightsAffirmed: true,
     })];
   }), [bundle]);
-  const hardCostCap = qualityProfile === 'local' ? 0 : qualityProfile === 'cheap' ? 15 : 100;
+  const hardCostCap = qualityProfile === 'local' ? 0 : qualityProfile === 'cheap' ? 15 : 25;
   const estimatedMaximumCost = qualityProfile === 'local' ? 0 : selectedCloudProviders.reduce((sum, profile) => {
-    const calls = profile.provider === 'openrouter' ? (qualityProfile === 'studio' ? 3 + maxReferenceImages : 2)
-      : profile.provider === 'openai' ? maxReferenceImages + maxAssetGenerations + (qualityProfile === 'studio' ? maxAssetGenerations * 4 : 0)
+    const calls = profile.provider === 'openrouter' ? (qualityProfile === 'studio'
+      ? 2 + maxReferenceImages * 3 + maxReferenceImages * 3 + 3 + maxReferenceImages
+      : 2)
+      : profile.provider === 'openrouter-image' || profile.provider === 'openai' ? (qualityProfile === 'studio'
+        ? maxReferenceImages * 3 + maxAssetGenerations + maxAssetGenerations * 3 * 2
+        : maxReferenceImages + maxAssetGenerations)
         : profile.provider === 'sam2-local' ? maxAssetGenerations
-          : maxAssetGenerations * (qualityProfile === 'studio' ? 3 : 1);
+          : maxAssetGenerations * (qualityProfile === 'studio' ? 2 : 1);
     return sum + calls * profile.cost.usd;
   }, 0);
   const previewBundle = useMemo(() => VisualWorldBundleSchema.parse({
@@ -308,6 +361,88 @@ export function App() {
     history.apply(`${tool} entity`, (state) => ({ ...state, entityTransforms: { ...state.entityTransforms, [selectedEntity]: transform }, revision: state.revision + 1 }));
   };
 
+  const refreshCompileWorkspace = async (compileId: string) => {
+    const endpoint = compilerEndpoint();
+    const [catalogResponse, reportResponse] = await Promise.all([
+      fetch(`${endpoint}/v1/compiles/${encodeURIComponent(compileId)}/artifacts`),
+      fetch(`${endpoint}/v1/compiles/${encodeURIComponent(compileId)}/report`),
+    ]);
+    if (!catalogResponse.ok || !reportResponse.ok) throw new Error(`Compile workspace returned ${catalogResponse.status}/${reportResponse.status}`);
+    const catalog = CompileArtifactCatalogSchema.parse(await catalogResponse.json());
+    const report = CompileReportSchema.parse(await reportResponse.json());
+    setCompileWorkspace({ id: compileId, status: report.status, catalog, report });
+  };
+
+  const loadPublishedCompile = (compileEvent: { data?: Record<string, unknown> }, endpoint: string) => {
+    const rawBundle = VisualWorldBundleSchema.parse(compileEvent.data?.['bundle']);
+    const nextBundle = resolveBundleAssetUris(rawBundle, new URL(`${endpoint}/v1/worlds/${encodeURIComponent(rawBundle.worldId)}/bundle`));
+    const nextDesign = WorldDesignSpecSchema.parse(compileEvent.data?.['designSpec']);
+    const nextAuthoring = AuthoringWorldSchema.parse(compileEvent.data?.['authoringWorld']);
+    setBundle(nextBundle);
+    setDesign(nextDesign);
+    setAuthoringWorld(nextAuthoring);
+    setRemoteWorld({ id: nextBundle.worldId, revision: nextBundle.sourceRevision });
+    setSelectedRegion(nextDesign.regions[0]!.id);
+    baseTransforms.current.clear();
+    baseInstances.current.clear();
+    for (const uri of assetObjectUrls.current) URL.revokeObjectURL(uri);
+    assetObjectUrls.current.clear();
+    assetFiles.current.clear();
+    const nextState: EditorState = {
+      prompt: nextDesign.prompt,
+      time: nextDesign.environment.timeOfDay,
+      weather: nextDesign.environment.weather,
+      densities: Object.fromEntries(nextDesign.regions.map((region) => [region.id, region.density])),
+      terrainEdits: structuredClone(nextAuthoring.terrain.edits),
+      assetReplacements: {}, entityTransforms: {}, revision: nextAuthoring.revision,
+    };
+    savedState.current = structuredClone(nextState);
+    history.reset(nextState);
+    setEvents((items) => [`Published and loaded ${nextDesign.title}: ${nextBundle.chunks.length} chunks, ${nextAuthoring.entities.length.toLocaleString()} entities`, ...items].slice(0, 8));
+  };
+
+  const attachCompileStream = (compileId: string, execute: boolean) => {
+    const endpoint = compilerEndpoint();
+    const stream = new EventSource(`${endpoint}/v1/compiles/${compileId}/events`);
+    stream.addEventListener('cost', (event) => {
+      const payload = JSON.parse((event as MessageEvent<string>).data) as { data?: { estimatedCostUsd?: number } };
+      const costUsd = payload.data?.estimatedCostUsd ?? 0;
+      setJobs((items) => items.map((job) => job.id === compileId ? { ...job, costUsd } : job));
+      setCompileWorkspace((current) => current?.id === compileId ? { ...current, status: 'in-progress' } : current);
+    });
+    stream.addEventListener('artifact', (event) => {
+      void refreshCompileWorkspace(compileId).catch((error: unknown) => setEvents((items) => [`Artifact catalog unavailable: ${(error as Error).message}`, ...items].slice(0, 8)));
+      try {
+        const compileEvent = JSON.parse((event as MessageEvent<string>).data) as { data?: Record<string, unknown> };
+        if (!execute) {
+          setEvents((items) => ['Dry-run artifacts validated without replacing the open world', ...items].slice(0, 8));
+          return;
+        }
+        loadPublishedCompile(compileEvent, endpoint);
+      } catch (error) {
+        setEvents((items) => [`Compiler artifact rejected: ${(error as Error).message}`, ...items].slice(0, 8));
+      }
+    });
+    for (const active of ['phase-started', 'progress']) stream.addEventListener(active, () => setCompileWorkspace((current) => current?.id === compileId ? { ...current, status: 'in-progress' } : current));
+    for (const terminal of ['completed', 'needs-attention', 'failed', 'cancelled']) stream.addEventListener(terminal, (event) => {
+      const payload = JSON.parse((event as MessageEvent<string>).data) as { type: string; message?: string };
+      setJobs((items) => items.map((job) => job.id === compileId ? { ...job, status: payload.type } : job));
+      if (payload.type !== 'completed') setEvents((items) => [`Cloud compile ${payload.type}: ${payload.message ?? 'all staged artifacts remain available'}. Open world unchanged.`, ...items].slice(0, 8));
+      void refreshCompileWorkspace(compileId).catch((error: unknown) => setEvents((items) => [`Compile report unavailable: ${(error as Error).message}`, ...items].slice(0, 8)));
+      stream.close();
+    });
+    return stream;
+  };
+
+  const resumeCompile = async (newCap: number) => {
+    if (!compileWorkspace) return;
+    const response = await fetch(`${compilerEndpoint()}/v1/compiles/${encodeURIComponent(compileWorkspace.id)}/resume`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ maxCostUsd: newCap, confirmed: true }) });
+    if (!response.ok) throw new Error(`Resume returned ${response.status}`);
+    setCompileWorkspace((current) => current ? { ...current, status: 'in-progress' } : current);
+    setJobs((items) => items.map((job) => job.id === compileWorkspace.id ? { ...job, status: 'in-progress' } : job));
+    attachCompileStream(compileWorkspace.id, true);
+  };
+
   const estimate = async (execute = false) => {
     setCompileState('estimating');
     const endpoint = compilerEndpoint();
@@ -316,20 +451,22 @@ export function App() {
         const selectedProfiles = qualityProfile === 'local' ? [] : qualityProfile === 'cheap' ? [
           { profile: cheapProviders.find((item) => item.provider === 'openrouter')!, role: 'planner' },
           { profile: cheapProviders.find((item) => item.provider === 'openrouter')!, role: 'reviewer' },
-          { profile: cheapProviders.find((item) => item.provider === 'openai')!, role: 'composition-image' },
+          { profile: imageProvider!, role: 'composition-image' },
           { profile: cheapProviders.find((item) => item.provider === 'wavespeed')!, role: 'image-to-3d' },
         ] : [
           { profile: studioProviders.find((item) => item.provider === 'openrouter')!, role: 'planner' },
           { profile: studioProviders.find((item) => item.provider === 'openrouter')!, role: 'reviewer' },
           { profile: studioProviders.find((item) => item.provider === 'openrouter')!, role: 'object-detection' },
-          { profile: studioProviders.find((item) => item.provider === 'openai')!, role: 'composition-image' },
-          { profile: studioProviders.find((item) => item.provider === 'openai')!, role: 'multiview-image' },
+          { profile: imageProvider!, role: 'composition-image' },
+          { profile: imageProvider!, role: 'multiview-image' },
           { profile: studioProviders.find((item) => item.provider === 'sam2-local')!, role: 'segmentation' },
           { profile: studioMeshProvider!, role: 'image-to-3d' },
         ];
         const providerModels = selectedProfiles.map(({ profile, role }) => ({ provider: profile.provider, modelId: profile.modelId, revision: profile.revision, termsFingerprint: profile.termsFingerprint, role }));
         const response = await fetch(`${endpoint}/v1/compiles`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({
-          prompt: editor.prompt, seed: bundle.seed, qualityProfile, heroRegionIds, refinementPolicy: qualityProfile === 'studio' ? { maxAssetRepairRounds: 2, maxSceneRepairRounds: 1, terrainCoDeformation: true } : { maxAssetRepairRounds: 0, maxSceneRepairRounds: 0, terrainCoDeformation: false },
+          prompt: editor.prompt, seed: bundle.seed, qualityProfile, heroRegionIds, refinementPolicy: qualityProfile === 'studio'
+            ? { maxTerrainRounds: 3, maxCompositionAttempts: 3, maxAssetAttempts: 2, maxSceneRounds: 3, maxAssetRepairRounds: 2, maxSceneRepairRounds: 1, terrainCoDeformation: true }
+            : { maxTerrainRounds: 0, maxCompositionAttempts: 1, maxAssetAttempts: 1, maxSceneRounds: 0, maxAssetRepairRounds: 0, maxSceneRepairRounds: 0, terrainCoDeformation: false },
           maxCostUsd: hardCostCap, maxAssetGenerations: qualityProfile === 'local' ? 0 : maxAssetGenerations,
           maxReferenceImages: qualityProfile === 'local' ? 0 : maxReferenceImages, territory: 'NL', commercialUse: true, dryRun: !execute, providerModels,
           assetLibrary: reusableAssetLibrary,
@@ -337,56 +474,8 @@ export function App() {
         if (!response.ok) throw new Error(`Compiler returned ${response.status}`);
         const result = await response.json() as { compileId: string };
         setJobs((items) => [{ id: result.compileId, kind: 'compile' as const, status: 'queued', createdAt: new Date().toISOString(), costUsd: 0 }, ...items].slice(0, 30));
-        const stream = new EventSource(`${endpoint}/v1/compiles/${result.compileId}/events`);
-        stream.addEventListener('cost', (event) => {
-          const payload = JSON.parse((event as MessageEvent<string>).data) as { data?: { estimatedCostUsd?: number } };
-          const costUsd = payload.data?.estimatedCostUsd ?? 0;
-          setJobs((items) => items.map((job) => job.id === result.compileId ? { ...job, costUsd } : job));
-        });
-        stream.addEventListener('artifact', (event) => {
-          try {
-            const compileEvent = JSON.parse((event as MessageEvent<string>).data) as { data?: Record<string, unknown> };
-            if (!execute) {
-              setEvents((items) => [`Dry-run artifacts validated without replacing the open world`, ...items].slice(0, 8));
-              return;
-            }
-            const rawBundle = VisualWorldBundleSchema.parse(compileEvent.data?.['bundle']);
-            const nextBundle = resolveBundleAssetUris(rawBundle, new URL(`${endpoint}/v1/worlds/${encodeURIComponent(rawBundle.worldId)}/bundle`));
-            const nextDesign = WorldDesignSpecSchema.parse(compileEvent.data?.['designSpec']);
-            const nextAuthoring = AuthoringWorldSchema.parse(compileEvent.data?.['authoringWorld']);
-            setBundle(nextBundle);
-            setDesign(nextDesign);
-            setAuthoringWorld(nextAuthoring);
-            setRemoteWorld({ id: nextBundle.worldId, revision: nextBundle.sourceRevision });
-            setSelectedRegion(nextDesign.regions[0]!.id);
-            baseTransforms.current.clear();
-            baseInstances.current.clear();
-            for (const uri of assetObjectUrls.current) URL.revokeObjectURL(uri);
-            assetObjectUrls.current.clear();
-            assetFiles.current.clear();
-            const nextState: EditorState = {
-              prompt: nextDesign.prompt,
-              time: nextDesign.environment.timeOfDay,
-              weather: nextDesign.environment.weather,
-              densities: Object.fromEntries(nextDesign.regions.map((region) => [region.id, region.density])),
-              terrainEdits: structuredClone(nextAuthoring.terrain.edits),
-              assetReplacements: {},
-              entityTransforms: {},
-              revision: nextAuthoring.revision,
-            };
-            savedState.current = structuredClone(nextState);
-            history.reset(nextState);
-            setEvents((items) => [`Loaded compiled ${nextDesign.title}: ${nextBundle.chunks.length} chunks, ${nextAuthoring.entities.length.toLocaleString()} entities`, ...items].slice(0, 8));
-          } catch (error) {
-            setEvents((items) => [`Compiler artifact rejected: ${(error as Error).message}`, ...items].slice(0, 8));
-          }
-        });
-        for (const terminal of ['completed', 'failed', 'cancelled']) stream.addEventListener(terminal, (event) => {
-          const payload = JSON.parse((event as MessageEvent<string>).data) as { type: string; message?: string };
-          setJobs((items) => items.map((job) => job.id === result.compileId ? { ...job, status: payload.type } : job));
-          if (payload.type !== 'completed') setEvents((items) => [`Compile ${payload.type}: ${payload.message ?? 'no provider detail returned'}`, ...items].slice(0, 8));
-          stream.close();
-        });
+        setCompileWorkspace({ id: result.compileId, status: 'queued' });
+        attachCompileStream(result.compileId, execute);
         setEvents((items) => [`${execute ? 'Compile' : 'Dry run'} ${result.compileId.slice(0, 8)} queued — $${hardCostCap.toFixed(2)} hard cap`, ...items].slice(0, 8));
     } catch (error) {
       setEvents((items) => [`Compiler unavailable: ${(error as Error).message}`, ...items].slice(0, 8));
@@ -399,11 +488,11 @@ export function App() {
     setCompileLimitsConfirmed(false);
     if (profile === 'local') { setMaxAssetGenerations(0); setMaxReferenceImages(0); setHeroRegionIds([]); }
     if (profile === 'cheap') { setMaxAssetGenerations(5); setMaxReferenceImages(1); setHeroRegionIds([selectedRegion]); }
-    if (profile === 'studio') { setMaxAssetGenerations(20); setMaxReferenceImages(5); setHeroRegionIds(design.regions.slice(0, 5).map((item) => item.id)); }
+    if (profile === 'studio') { setMaxAssetGenerations(8); setMaxReferenceImages(1); setHeroRegionIds([selectedRegion]); }
   };
 
   const toggleHeroRegion = (regionId: string) => {
-    const maximum = qualityProfile === 'studio' ? 5 : qualityProfile === 'cheap' ? 1 : 0;
+    const maximum = qualityProfile === 'studio' ? 1 : qualityProfile === 'cheap' ? 1 : 0;
     setHeroRegionIds((current) => current.includes(regionId) ? current.filter((id) => id !== regionId) : maximum === 1 ? [regionId] : [...current, regionId].slice(0, maximum));
   };
 
@@ -659,7 +748,7 @@ export function App() {
     <main className="app-shell">
       <header className="topbar">
         <div className="brand"><span className="brand-mark"><Icon size={21}>{icons.cube}</Icon></span><span>WORLD<strong>ENGINE</strong></span><span className="version">0.1</span></div>
-        <div className="project-title"><span className="status-dot" /> {design.title} <span>/</span> Bundle {bundle.bundleVersion}</div>
+        <div className="project-title"><span className="status-dot" /> {design.title} <span>/</span> {bundle.qualityProfile === 'local' ? 'Local draft' : `${bundle.qualityProfile} published`} <span>/</span> Bundle {bundle.bundleVersion}</div>
         <div className="top-actions"><button className="icon-text-button" disabled={!history.canUndo} onClick={history.undo} title={history.undoLabel}>↶ Undo</button><button className="icon-text-button" disabled={!history.canRedo} onClick={history.redo} title={history.redoLabel}>↷ Redo</button><button className="ghost-button" onClick={captureSnapshot}>Snapshot</button>{remoteWorld && <button className="ghost-button" onClick={() => void savePatch().catch((error: unknown) => setEvents((items) => [`Save failed: ${(error as Error).message}`, ...items].slice(0, 8)))}>Save patch</button>}<button className="ghost-button" onClick={() => void exportBundle()}>Export bundle</button><button className="primary-button" onClick={() => { setCompileLimitsConfirmed(false); setConfirmCompile(true); }} disabled={compileState === 'estimating'}>{compileState === 'estimating' ? 'Estimating…' : 'Compile world'}</button></div>
       </header>
 
@@ -681,17 +770,17 @@ export function App() {
             </nav>
           </> : leftTab === 'assets' ? <section className="asset-grid"><input ref={fileInputRef} type="file" accept=".glb,model/gltf-binary" hidden onChange={(event) => void replaceAsset(event.target.files?.[0])}/>{!remoteWorld && <p className="asset-gate-note">Compile a remote world first. Reviewed GLBs are uploaded directly into an immutable world version and are never embedded in a compile request.</p>}{bundle.prototypes.map((prototype) => <button key={prototype.id} disabled={!remoteWorld} title={!remoteWorld ? 'Compile world before importing assets' : `Replace ${prototype.tags[0]}`} onClick={() => { setSelectedAsset(prototype.id); fileInputRef.current?.click(); }}><span className="asset-thumb"><Icon size={24}>{icons.cube}</Icon></span><span>{prototype.tags[0]}</span><small>{editor.assetReplacements[prototype.id]?.fileName ?? 'Library · reviewed'}</small></button>)}</section> : <section className="generation-panel">
             <small>SERVER-SIDE BYOK</small><h3>Generation pipeline</h3><p>Keys never enter this browser or an exported game. Configure them on the compiler service with reviewed provider policies.</p>
-            <label className={`generation-mode ${qualityProfile === 'local' ? 'active' : ''}`}><input type="radio" name="generation-mode" checked={qualityProfile === 'local'} onChange={() => chooseQualityProfile('local')} /><span><strong>Local</strong><small>$0 · deterministic world and polished placeholders</small></span></label>
+            <label className={`generation-mode ${qualityProfile === 'local' ? 'active' : ''}`}><input type="radio" name="generation-mode" checked={qualityProfile === 'local'} onChange={() => chooseQualityProfile('local')} /><span><strong>Local draft</strong><small>$0 · deterministic procedural preview with marked placeholders</small></span></label>
             <label className={`generation-mode ${qualityProfile === 'cheap' ? 'active' : ''} ${cheapProviders.length !== 3 ? 'disabled' : ''}`}><input type="radio" name="generation-mode" checked={qualityProfile === 'cheap'} disabled={cheapProviders.length !== 3} onChange={() => chooseQualityProfile('cheap')} /><span><strong>Cheap</strong><small>≤ $15 · one hero region · five generated assets</small></span></label>
-            <label className={`generation-mode ${qualityProfile === 'studio' ? 'active' : ''} ${studioProviders.length !== 4 || compilerHealth?.generation?.qualityProfiles?.studio.available !== true ? 'disabled' : ''}`}><input type="radio" name="generation-mode" checked={qualityProfile === 'studio'} disabled={studioProviders.length !== 4 || compilerHealth?.generation?.qualityProfiles?.studio.available !== true} onChange={() => chooseQualityProfile('studio')} /><span><strong>Studio</strong><small>≤ $100 · detection, SAM2, multiview PBR, Blender asset repair and terrain support fitting</small></span></label>
+            <label className={`generation-mode ${qualityProfile === 'studio' ? 'active' : ''} ${studioProviders.length !== 4 || compilerHealth?.generation?.qualityProfiles?.studio.available !== true ? 'disabled' : ''}`}><input type="radio" name="generation-mode" checked={qualityProfile === 'studio'} disabled={studioProviders.length !== 4 || compilerHealth?.generation?.qualityProfiles?.studio.available !== true} onChange={() => chooseQualityProfile('studio')} /><span><strong>Studio · experimental</strong><small>First gate ≤ $25 · one hero region · eight multiview PBR assets</small></span></label>
             <div className="provider-list">{(compilerHealth?.generation?.providers ?? []).map((profile) => { const ready = profile.operational && profile.configured; return <div key={`${profile.provider}:${profile.modelId}`} title={profile.operationalIssues.join(', ')}><i className={ready ? 'ready' : ''} /><span><strong>{profile.provider}</strong><small>{profile.modelId}</small></span><em>{ready ? 'READY' : !profile.operational ? 'POLICY REVIEW' : 'NO KEY'}</em></div>; })}{!compilerHealth?.generation && <p>Connect the current compiler service to inspect providers.</p>}</div>
             {!cloudAvailable && <div className="provider-setup"><strong>Why there is no API-key dialog</strong><p>This browser intentionally never asks for API keys. Review the policy file, put keys in the compiler service's ignored <code>.env.local</code>, then start:</p><code>pnpm --filter @worldengine/compiler-service dev:configured</code></div>}
-            {qualityProfile === 'studio' && <label className="studio-provider">3D bake-off winner<select value={studio3dProvider} onChange={(event) => setStudio3dProvider(event.target.value as 'tripo' | 'meshy')}><option value="tripo">Direct Tripo multiview</option><option value="meshy">Meshy multi-image PBR</option></select></label>}
-            {qualityProfile !== 'local' && <div className="hero-regions"><small>HERO REGIONS · {heroRegionIds.length}/{qualityProfile === 'studio' ? 5 : 1}</small>{design.regions.map((item) => <label key={item.id}><input type="checkbox" checked={heroRegionIds.includes(item.id)} onChange={() => toggleHeroRegion(item.id)} /><span>{item.name}</span></label>)}</div>}
-            <div className="generation-limits"><label>3D assets<input type="number" min="0" max={qualityProfile === 'cheap' ? 5 : 20} value={maxAssetGenerations} disabled={qualityProfile === 'local'} onChange={(event) => setMaxAssetGenerations(Math.max(0, Math.min(qualityProfile === 'cheap' ? 5 : 20, Number(event.target.value))))} /></label><label>Region images<input type="number" min="0" max={qualityProfile === 'cheap' ? 1 : 5} value={maxReferenceImages} disabled={qualityProfile === 'local'} onChange={(event) => setMaxReferenceImages(Math.max(0, Math.min(qualityProfile === 'cheap' ? 1 : 5, Number(event.target.value))))} /></label></div>
+            {qualityProfile === 'studio' && <div className="studio-provider"><strong>Fixed reconstruction profile</strong><small>WaveSpeed · tripo3d/h3.1/multiview-to-3d · front/left/back/right · PBR</small></div>}
+            {qualityProfile !== 'local' && <div className="hero-regions"><small>HERO REGIONS · {heroRegionIds.length}/1</small>{design.regions.map((item) => <label key={item.id}><input type="checkbox" checked={heroRegionIds.includes(item.id)} onChange={() => toggleHeroRegion(item.id)} /><span>{item.name}</span></label>)}</div>}
+            <div className="generation-limits"><label>3D assets<input type="number" min="0" max={qualityProfile === 'cheap' ? 5 : 8} value={maxAssetGenerations} disabled={qualityProfile === 'local'} onChange={(event) => setMaxAssetGenerations(Math.max(0, Math.min(qualityProfile === 'cheap' ? 5 : 8, Number(event.target.value))))} /></label><label>Region images<input type="number" min="0" max="1" value={maxReferenceImages} disabled={qualityProfile === 'local'} onChange={(event) => setMaxReferenceImages(Math.max(0, Math.min(1, Number(event.target.value))))} /></label></div>
             <small className="generation-reuse">{reusableAssetLibrary.length > 0 ? `${reusableAssetLibrary.length} reviewed GLB asset${reusableAssetLibrary.length === 1 ? '' : 's'} will be reused before generation.` : 'No reusable reviewed GLBs yet. A fully generated reference catalog needs up to 20 assets and 5 regional images.'}</small>
             <div className="cost-preview"><span>Estimate / hard maximum</span><strong>${estimatedMaximumCost.toFixed(2)} / ${hardCostCap.toFixed(2)}</strong></div>
-            <div className="blender-status"><strong>Studio refinement</strong><span>Blender 5.1 worker · {compilerHealth?.generation?.blenderWorker ?? 'not connected'}</span><small>Blender executes fixed asset repair and RGB/depth/normal/instance passes. WorldEngine applies bounded deterministic terrain support edits. Generated Python is never evaluated.</small></div>
+            <div className="blender-status"><strong>Studio refinement</strong><span>Blender 5.1 worker · {compilerHealth?.generation?.blenderWorker ?? 'not connected'}</span><small>Blender executes only fixed mesh and region jobs with RGB/depth/normal/semantic/instance passes. WorldEngine applies bounded mesh-footprint support edits. Generated Python is never evaluated.</small></div>
             {bundle.qualityCertification && <div className={`quality-score ${bundle.qualityCertification.certified ? 'certified' : 'failed'}`}><small>VISUAL WORLD PARITY V1</small><strong>{bundle.qualityCertification.weightedScore.toFixed(1)}/100</strong><span>{bundle.qualityCertification.certified ? 'CERTIFIED' : 'NOT CERTIFIED'}</span>{remoteWorld && <a href={`${compilerEndpoint()}/v1/worlds/${encodeURIComponent(remoteWorld.id)}/quality-report?format=html`} target="_blank" rel="noreferrer">Open immutable report</a>}</div>}
           </section>}
         </aside>
@@ -720,11 +809,11 @@ export function App() {
             <section className="property-section environment"><h3><Icon size={16}>{icons.sun}</Icon> Environment</h3><label>Time of day <span>{String(Math.floor(editor.time)).padStart(2,'0')}:{String(Math.round((editor.time % 1) * 60)).padStart(2,'0')}<input type="range" min="0" max="24" step="0.1" value={editor.time} onChange={(event) => history.apply('Time of day', (current) => ({ ...current, time: Number(event.target.value), revision: current.revision + 1 }))}/></span></label><label>Weather<select value={editor.weather} onChange={(event) => history.apply('Weather', (current) => ({ ...current, weather: event.target.value as EditorState['weather'], revision: current.revision + 1 }))}><option>clear</option><option>cloudy</option><option>rain</option><option>snow</option><option>fog</option></select></label></section>
             <section className="property-section provenance"><h3>Provenance</h3><div><span className="check">✓</span><p><strong>{bundle.provenance.every((record) => record.reviewedAt) ? 'All assets reviewed' : 'Review required'}</strong><small>{bundle.provenance.length} records · {bundle.provenance.filter((record) => record.kind === 'imported').length} imported</small></p></div><ul>{bundle.provenance.map((record) => <li key={record.id}><strong>{record.subjectId}</strong><span>{record.kind} · {record.provider ?? record.license.name}</span><small>{record.contentHash.slice(0, 12)}… · {record.reviewedAt ? 'reviewed' : 'pending'}</small></li>)}</ul></section>
             <section className="property-section snapshot-comparison"><h3>Snapshot comparison</h3><p>{lastSnapshot ? `${lastSnapshot.name} · ${snapshotChanged ? 'unsaved visual changes' : 'identical'}` : 'Capture a snapshot to compare changes.'}</p><small>{editor.terrainEdits.length} terrain edits · {Object.keys(editor.assetReplacements).length} asset replacements</small></section>
-          </> : <section className="diagnostics-list">{events.map((event, index) => <div key={`${event}-${index}`}><span className={event.includes('unavailable') || event.includes('error') ? 'warning' : ''}>{event.includes('unavailable') ? '!' : '✓'}</span><p>{event}<small>{index === 0 ? 'just now' : `${index + 1}m ago`}</small></p></div>)}<h3 className="jobs-heading">Job history</h3>{jobs.map((job) => <div key={job.id}><span>{job.status === 'completed' ? '✓' : '·'}</span><p>{job.kind} · {job.status}<small>{job.id.slice(0, 12)} · ${job.costUsd.toFixed(2)}</small></p></div>)}</section>}
+          </> : <><section className="diagnostics-list">{events.map((event, index) => <div key={`${event}-${index}`}><span className={event.includes('unavailable') || event.includes('error') || event.includes('attention') ? 'warning' : ''}>{event.includes('unavailable') || event.includes('attention') ? '!' : '✓'}</span><p>{event}<small>{index === 0 ? 'just now' : `${index + 1}m ago`}</small></p></div>)}<h3 className="jobs-heading">Job history</h3>{jobs.map((job) => <div key={job.id}><span>{job.status === 'completed' ? '✓' : '·'}</span><p>{job.kind} · {job.status}<small>{job.id.slice(0, 12)} · ${job.costUsd.toFixed(2)}</small></p></div>)}</section>{compileWorkspace && <CompileArtifactWorkspace workspace={compileWorkspace} endpoint={compilerEndpoint()} onResume={async (cap) => { try { await resumeCompile(cap); } catch (error) { setEvents((items) => [`Resume failed: ${(error as Error).message}`, ...items].slice(0, 8)); } }} />}</>}
         </aside>
       </div>
 
-      <footer className="statusbar"><span><i className="ok" /> Bundle valid</span><span>{bundle.chunks.length} / {bundle.chunks.length} chunks</span><span>{bundle.prototypes.length} prototypes</span><span>{(authoringWorld?.entities.length ?? 5_143).toLocaleString()} instances</span><span>REV {editor.revision}</span><span className="status-spacer" /><span>RH · Y-UP · METERS</span><span>{snapshots.length + 1} snapshots</span></footer>
+      <footer className="statusbar"><span><i className="ok" /> Bundle valid</span><span>{bundle.chunks.length} / {bundle.chunks.length} chunks</span><span>{bundle.prototypes.length} prototypes</span><span>{(authoringWorld?.entities.length ?? estimatedLocalInstanceCount).toLocaleString()} instances</span><span>REV {editor.revision}</span><span className="status-spacer" /><span>RH · Y-UP · METERS</span><span>{snapshots.length + 1} snapshots</span></footer>
       {regenerationOpen && <div className="modal-backdrop" role="presentation"><section className="cost-modal asset-import-modal" role="dialog" aria-modal="true" aria-labelledby="regenerate-title"><small>SCHEMA-VALID REGENERATION</small><h2 id="regenerate-title">Regenerate {region.name}</h2><p>Topology, stable IDs, landmarks, user assets, legal metadata, and the current revision remain protected.</p><label>Regional visual direction<textarea value={regenerationPrompt} onChange={(event) => setRegenerationPrompt(event.target.value)} /></label><dl><div><dt>Maximum cost</dt><dd>$0.00</dd></div><div><dt>Affected chunks</dt><dd>{bundle.chunks.filter((entry) => entry.bounds.max[0] >= Math.min(...region.polygon.map((point) => point[0])) && entry.bounds.min[0] <= Math.max(...region.polygon.map((point) => point[0])) && entry.bounds.max[1] >= Math.min(...region.polygon.map((point) => point[1])) && entry.bounds.min[1] <= Math.max(...region.polygon.map((point) => point[1]))).length}</dd></div></dl><div><button className="ghost-button" onClick={() => setRegenerationOpen(false)}>Cancel</button><button className="primary-button" disabled={regenerationPrompt.trim().length === 0} onClick={() => void regenerateRegion()}>Apply regeneration</button></div></section></div>}
       {pendingAsset && <div className="modal-backdrop" role="presentation"><section className="cost-modal asset-import-modal" role="dialog" aria-modal="true" aria-labelledby="asset-import-title"><small>ASSET RIGHTS GATE</small><h2 id="asset-import-title">Review imported GLB</h2><p>{pendingAsset.file.name} · {(pendingAsset.file.size / 1024).toFixed(1)} KB · SHA-256 {pendingAsset.contentHash.slice(0, 12)}…</p><label>License name<input value={assetLicenseName} required onChange={(event) => setAssetLicenseName(event.target.value)} /></label><label>License URL (optional)<input type="url" aria-invalid={!assetLicenseUrlValid} value={assetLicenseUrl} placeholder="https://…" onChange={(event) => setAssetLicenseUrl(event.target.value)} />{!assetLicenseUrlValid && <small>Enter a valid absolute URL.</small>}</label><label>Attribution (optional)<input value={assetAttribution} onChange={(event) => setAssetAttribution(event.target.value)} /></label><label className="rights-affirmation"><input type="checkbox" checked={assetRightsAffirmed} onChange={(event) => setAssetRightsAffirmed(event.target.checked)} /> I affirm that I have the right to use this asset commercially and that the metadata above is accurate.</label><div><button className="ghost-button" onClick={() => setPendingAsset(undefined)}>Cancel</button><button className="primary-button" disabled={!assetRightsAffirmed || assetLicenseName.trim().length === 0 || !assetLicenseUrlValid} onClick={confirmAssetImport}>Stage reviewed asset</button></div></section></div>}
       {confirmCompile && <div className="modal-backdrop" role="presentation"><section className="cost-modal" role="dialog" aria-modal="true" aria-labelledby="cost-title"><small>{qualityProfile === 'local' ? 'LOCAL COMPILE GATE' : `${qualityProfile.toUpperCase()} BILLABLE WORK GATE`}</small><h2 id="cost-title">Confirm compile</h2><p>{qualityProfile === 'local' ? 'This compile is deterministic and calls no provider.' : 'Only the exact reviewed server-side roles below may run. There is no model fallback, blind retry, or camera-triggered generation.'}</p><dl><div><dt>Estimated / maximum cost</dt><dd>${estimatedMaximumCost.toFixed(2)} / ${hardCostCap.toFixed(2)}</dd></div><div><dt>Asset generations</dt><dd>{qualityProfile === 'local' ? 0 : maxAssetGenerations}</dd></div><div><dt>Hero regions</dt><dd>{qualityProfile === 'local' ? 0 : heroRegionIds.length}</dd></div><div><dt>Provider models</dt><dd>{qualityProfile === 'local' ? 'None' : selectedCloudProviders.map((profile) => profile.modelId).join(', ')}</dd></div></dl><label><input type="checkbox" checked={compileLimitsConfirmed} onChange={(event) => setCompileLimitsConfirmed(event.target.checked)} /> I confirm the displayed hard limits</label><div><button className="ghost-button" onClick={() => setConfirmCompile(false)}>Cancel</button><button className="primary-button" disabled={!compileLimitsConfirmed || (qualityProfile !== 'local' && (!cloudAvailable || heroRegionIds.length === 0))} onClick={() => { setConfirmCompile(false); void estimate(true); }}>Confirm & compile</button></div></section></div>}

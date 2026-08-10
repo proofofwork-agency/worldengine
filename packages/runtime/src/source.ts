@@ -1,4 +1,4 @@
-import { RuntimeChunkDocumentSchema, VisualWorldBundleSchema, migrateWorldFormatDocument, type ChunkId, type RuntimeChunkDocument, type TerrainEdit, type VisualWorldBundle } from '@worldengine/schema';
+import { RuntimeChunkDocumentSchema, VisualWorldBundleSchema, migrateWorldFormatDocument, type ChunkId, type RuntimeChunkDocument, type TerrainEdit, type TerrainMaterialSet, type VisualWorldBundle } from '@worldengine/schema';
 import { generateReferenceChunkAsync } from '@worldengine/terrain';
 import type { WorldBundleSource } from './contracts.js';
 
@@ -48,12 +48,19 @@ function assertManifestIdentity(bundle: VisualWorldBundle): void {
 export function resolveBundleAssetUris(bundleInput: VisualWorldBundle, manifestUrl: URL): VisualWorldBundle {
   const bundle = VisualWorldBundleSchema.parse(bundleInput);
   assertManifestIdentity(bundle);
-  const resolveAsset = (assetUri: string): string => {
-    if (assetUri.startsWith('primitive://')) return assetUri;
+  const resolveRemote = (assetUri: string): string => {
     const resolved = new URL(assetUri, manifestUrl);
     if (!['http:', 'https:'].includes(resolved.protocol) || resolved.username || resolved.password) throw new Error(`Unsafe asset URL: ${assetUri}`);
     return resolved.href;
   };
+  const resolveAsset = (assetUri: string): string => assetUri.startsWith('primitive://') ? assetUri : resolveRemote(assetUri);
+  const resolveMaterial = (material: TerrainMaterialSet): TerrainMaterialSet => ({
+    ...material,
+    baseColorUri: resolveRemote(material.baseColorUri),
+    normalUri: resolveRemote(material.normalUri),
+    roughnessUri: resolveRemote(material.roughnessUri),
+    macroVariationUri: resolveRemote(material.macroVariationUri),
+  });
   return VisualWorldBundleSchema.parse({
     ...bundle,
     prototypes: bundle.prototypes.map((prototype) => ({
@@ -61,6 +68,25 @@ export function resolveBundleAssetUris(bundleInput: VisualWorldBundle, manifestU
       assetUri: resolveAsset(prototype.assetUri),
       lods: prototype.lods.map((lod) => ({ ...lod, assetUri: resolveAsset(lod.assetUri) })),
     })),
+    terrain: bundle.terrain?.kind === 'compiled-heightfield' ? {
+      ...bundle.terrain,
+      heightfieldUri: resolveRemote(bundle.terrain.heightfieldUri),
+      splatMapUris: bundle.terrain.splatMapUris.map(resolveRemote),
+      materialSets: bundle.terrain.materialSets.map(resolveMaterial),
+      terrainPlan: {
+        ...bundle.terrain.terrainPlan,
+        materialSets: bundle.terrain.terrainPlan.materialSets.map(resolveMaterial),
+      },
+    } : bundle.terrain,
+    chunks: bundle.chunks.map((entry) => entry.source.kind === 'compiled-heightfield' ? {
+      ...entry,
+      source: {
+        ...entry.source,
+        heightfieldDependency: resolveRemote(entry.source.heightfieldDependency),
+        splatDependencies: entry.source.splatDependencies.map(resolveRemote),
+        textureDependencies: entry.source.textureDependencies.map(resolveRemote),
+      },
+    } : entry),
   });
 }
 
@@ -80,7 +106,7 @@ export class HttpWorldBundleSource implements WorldBundleSource {
     const manifest = this.manifest ?? await this.loadManifest();
     const entry = manifest.chunks.find((chunk) => chunk.id === id);
     if (!entry) return this.loadPlaceholder(id);
-    if (entry.source.kind === 'procedural') return generateReferenceChunkAsync(manifest, entry.coordinate);
+    if (entry.source.kind === 'procedural' || entry.source.kind === 'compiled-heightfield') return generateReferenceChunkAsync(manifest, entry.coordinate);
     const chunkUrl = new URL(entry.source.uri, this.manifestUrl);
     if (!['http:', 'https:'].includes(chunkUrl.protocol) || chunkUrl.username || chunkUrl.password) throw new Error(`Unsafe chunk URL for ${id}`);
     const response = await this.fetcher(chunkUrl);

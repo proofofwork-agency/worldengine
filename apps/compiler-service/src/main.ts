@@ -1,7 +1,7 @@
 import { resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { ProviderTermsProfileSchema, type ProviderTermsProfile } from '@worldengine/schema';
-import { BlenderWorkerClient, DirectTripoMultiviewAdapter, LocalSam2SegmentationAdapter, MeshyMultiImageAdapter, OpenAIImageAdapter, OpenRouterPlanningAdapter, ProviderExecutionRegistry, WaveSpeedTripoAdapter, providerProfileOperationalIssues, type StudioWorkerRegistry } from '@worldengine/compiler';
+import { BlenderWorkerClient, LocalSam2SegmentationAdapter, OpenRouterImageAdapter, OpenRouterPlanningAdapter, ProviderExecutionRegistry, WaveSpeedTripoAdapter, WaveSpeedTripoMultiviewAdapter, providerProfileOperationalIssues, type StudioWorkerRegistry } from '@worldengine/compiler';
 import { startCompilerService } from './server.js';
 
 const dataDirectory = resolve(process.env['WORLDENGINE_DATA_DIR'] ?? 'data');
@@ -19,20 +19,13 @@ for (const profile of providerProfiles ?? []) {
     providerRegistry.register(new OpenRouterPlanningAdapter(profile.modelId, profile.revision, process.env['OPENROUTER_API_KEY']));
     configuredAdapters += 1;
   }
-  if (profile.provider === 'openai' && process.env['OPENAI_API_KEY']) {
-    providerRegistry.register(new OpenAIImageAdapter(profile.modelId, profile.revision, process.env['OPENAI_API_KEY']));
+  if (profile.provider === 'openrouter-image' && process.env['OPENROUTER_API_KEY']) {
+    providerRegistry.register(new OpenRouterImageAdapter(profile.modelId, profile.revision, process.env['OPENROUTER_API_KEY']));
     configuredAdapters += 1;
   }
   if (profile.provider === 'wavespeed' && process.env['WAVESPEED_API_KEY']) {
-    providerRegistry.register(new WaveSpeedTripoAdapter(profile.modelId, profile.revision, process.env['WAVESPEED_API_KEY']));
-    configuredAdapters += 1;
-  }
-  if (profile.provider === 'tripo' && process.env['TRIPO_API_KEY']) {
-    providerRegistry.register(new DirectTripoMultiviewAdapter(profile.modelId, profile.revision, process.env['TRIPO_API_KEY']));
-    configuredAdapters += 1;
-  }
-  if (profile.provider === 'meshy' && process.env['MESHY_API_KEY']) {
-    providerRegistry.register(new MeshyMultiImageAdapter(profile.modelId, profile.revision, process.env['MESHY_API_KEY']));
+    if (profile.modelId === 'tripo3d/h3.1/multiview-to-3d') providerRegistry.register(new WaveSpeedTripoMultiviewAdapter(profile.modelId, profile.revision, process.env['WAVESPEED_API_KEY']));
+    else providerRegistry.register(new WaveSpeedTripoAdapter(profile.modelId, profile.revision, process.env['WAVESPEED_API_KEY']));
     configuredAdapters += 1;
   }
   if (profile.provider === 'sam2-local' && process.env['WORLDENGINE_SAM2_CHECKPOINT'] && process.env['WORLDENGINE_SAM2_CONFIG']) {
@@ -46,8 +39,9 @@ for (const profile of (providerProfiles ?? []).filter((candidate) => candidate.e
   const selected = { provider: profile.provider, modelId: profile.modelId, revision: profile.revision };
   if (!providerRegistry.has(selected)) throw new Error(`Enabled provider ${profile.provider}/${profile.modelId}@${profile.revision} has no API credential or adapter`);
   if (profile.provider === 'openrouter') await providerRegistry.requireCapabilities(selected, { structuredOutput: true, imageInput: true });
-  else if (profile.provider === 'openai' || profile.provider === 'wavespeed') await providerRegistry.requireCapabilities(selected, { imageInput: true });
-  else if (profile.provider === 'tripo' || profile.provider === 'meshy') await providerRegistry.requireCapabilities(selected, { imageInput: true, multiImageInput: true, pbr3d: true });
+  else if (profile.provider === 'openrouter-image') await providerRegistry.requireCapabilities(selected, { imageInput: true });
+  else if (profile.provider === 'wavespeed' && profile.modelId === 'tripo3d/h3.1/multiview-to-3d') await providerRegistry.requireCapabilities(selected, { imageInput: true, multiImageInput: true, pbr3d: true });
+  else if (profile.provider === 'wavespeed') await providerRegistry.requireCapabilities(selected, { imageInput: true });
   else if (profile.provider === 'sam2-local') await providerRegistry.requireCapabilities(selected, { imageInput: true, segmentation: true });
   else throw new Error(`Enabled provider ${profile.provider} has no compiler role`);
 }

@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { EnvironmentIntentSchema, VisualStyleSchema } from './design.js';
+import { EnvironmentIntentSchema, TerrainMaterialSetSchema, TerrainPlanSchema, VisualStyleSchema } from './design.js';
 import { ProvenanceRecordSchema } from './provenance.js';
 import { Bounds2Schema, ChunkCoordinateSchema, ChunkIdSchema, EntityIdSchema, Mat4Schema, PrototypeIdSchema, WORLD_FORMAT_VERSION } from './primitives.js';
 import { RegionSpecSchema, WorldFeatureSpecSchema } from './design.js';
@@ -9,6 +9,7 @@ import { QualityCertificationSchema, QualityProfileSchema } from './quality.js';
 export const ChunkSourceSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('uri'), uri: z.string(), contentHash: z.string().regex(/^[a-f\d]{64}$/i), byteLength: z.number().int().nonnegative() }),
   z.object({ kind: z.literal('procedural'), seed: z.number().int().nonnegative(), generator: z.literal('worldengine-terrain-v1'), contentHash: z.string().regex(/^[a-f\d]{64}$/i) }),
+  z.object({ kind: z.literal('compiled-heightfield'), seed: z.number().int().nonnegative(), generator: z.literal('worldengine-terrain-v2'), contentHash: z.string().regex(/^[a-f\d]{64}$/i), heightfieldDependency: z.string().min(1), splatDependencies: z.array(z.string().min(1)).min(1), textureDependencies: z.array(z.string().min(1)).min(1) }),
 ]);
 
 export const RuntimePrototypeSchema = z.object({
@@ -44,6 +45,8 @@ export const RuntimeChunkDocumentSchema = z.object({
     minHeight: z.number(),
     maxHeight: z.number(),
     biomeWeights: z.string().optional(),
+    materialSplats: z.array(z.object({ materialSetId: z.string().min(1), encoding: z.literal('uint8-base64'), weights: z.string() })).default([]),
+    textureDependencies: z.array(z.string().min(1)).default([]),
   }),
   instances: z.array(RuntimeInstanceSchema),
   dependencies: z.array(z.string()).default([]),
@@ -73,13 +76,15 @@ export const VisualWorldBundleSchema = z.object({
   bounds: Bounds2Schema,
   chunkSize: z.number().positive(),
   terrainSamples: z.number().int().min(3),
-  terrain: z.object({
-    kind: z.literal('procedural'),
-    seed: z.number().int().nonnegative(),
-    amplitude: z.number().nonnegative(),
-    frequency: z.number().positive(),
-    edits: z.array(TerrainEditSchema).default([]),
-  }).optional(),
+  terrain: z.discriminatedUnion('kind', [
+    z.object({ kind: z.literal('procedural'), seed: z.number().int().nonnegative(), amplitude: z.number().nonnegative(), frequency: z.number().positive(), edits: z.array(TerrainEditSchema).default([]) }),
+    z.object({
+      kind: z.literal('compiled-heightfield'), seed: z.number().int().nonnegative(), heightfieldUri: z.string().min(1), contentHash: z.string().regex(/^[a-f\d]{64}$/i),
+      samples: z.number().int().min(3), encoding: z.literal('float32'), terrainPlan: TerrainPlanSchema,
+      materialSets: z.array(TerrainMaterialSetSchema).min(1), splatMapUris: z.array(z.string().min(1)).min(1), edits: z.array(TerrainEditSchema).default([]),
+      footprintEdits: z.array(z.object({ footprint: z.array(z.tuple([z.number(), z.number()])).min(3), targetHeight: z.number(), mode: z.enum(['raise', 'lower', 'flatten', 'smooth']).default('flatten'), supportMarginMeters: z.literal(2), falloffEndMeters: z.literal(5) })).default([]),
+    }),
+  ]).optional(),
   regions: z.array(RegionSpecSchema).default([]),
   features: z.array(WorldFeatureSpecSchema).default([]),
   style: VisualStyleSchema,

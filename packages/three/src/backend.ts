@@ -36,6 +36,7 @@ interface PrototypeLodSet { variants: THREE.InstancedMesh[][]; distances: number
 interface TerrainLodState { mesh: THREE.Mesh; levels: Array<{ distance: number; start: number; count: number }>; selected: number }
 interface AnimatedAsset { scene: THREE.Group; clips: THREE.AnimationClip[] }
 interface StaticVisual { parts: PrimitiveVisual[] }
+interface TerrainPbrTextures { baseColor: THREE.Texture; normal: THREE.Texture; roughness: THREE.Texture }
 
 const fallbackBiomeColors: Record<string, number> = {
   coastal: 0x718c83, wetland: 0x5f8061, forest: 0x456544, grassland: 0x82965f, highland: 0x777c70,
@@ -92,7 +93,9 @@ export class ThreeRendererBackend implements RendererBackend {
   private waterNormal: THREE.DataTexture | undefined;
   private terrainDetail: THREE.DataTexture | undefined;
   private terrainNormal: THREE.DataTexture | undefined;
+  private readonly terrainPbrTextures = new Map<string, TerrainPbrTextures>();
   private terrainRegionColors: THREE.Color[] = [];
+  private readonly terrainMaterialColors = new Map<string, THREE.Color>();
   private terrainFeatures: VisualWorldBundle['features'] = [];
   private weather: THREE.Points<THREE.BufferGeometry, THREE.PointsMaterial> | undefined;
   private weatherKind: string = 'clear';
@@ -142,9 +145,11 @@ export class ThreeRendererBackend implements RendererBackend {
   }
 
   async setWorld(bundle: VisualWorldBundle): Promise<void> {
-    if (bundle.prototypes.some((prototype) => prototype.textureFormat === 'ktx2') && !this.options.ktx2TranscoderPath) {
+    const terrainTextureUris = bundle.terrain?.kind === 'compiled-heightfield' ? bundle.terrain.materialSets.flatMap((material) => [material.baseColorUri, material.normalUri, material.roughnessUri, material.macroVariationUri]) : [];
+    if ((bundle.prototypes.some((prototype) => prototype.textureFormat === 'ktx2') || terrainTextureUris.some((uri) => uri.toLowerCase().endsWith('.ktx2'))) && !this.options.ktx2TranscoderPath) {
       throw new Error('This bundle contains KTX2 textures; configure ThreeRendererBackendOptions.ktx2TranscoderPath with matching Basis transcoder assets');
     }
+    if (bundle.qualityProfile === 'studio' && terrainTextureUris.some((uri) => !uri.toLowerCase().endsWith('.ktx2'))) throw new Error('Studio terrain requires KTX2 base-color, normal, roughness, and macrovariation textures');
     for (const id of [...this.chunkGroups.keys()]) this.unloadChunk(id);
     this.currentBundle = bundle;
     this.prototypes.clear();
@@ -153,11 +158,14 @@ export class ThreeRendererBackend implements RendererBackend {
     this.baseBackground = new THREE.Color(this.options.clearColor ?? 0x9cb8c5);
     this.baseFogDensity = bundle.environment.fogDensity;
     this.terrainRegionColors = bundle.regions.map((region, index) => biomeColor(region.biome, bundle.style.palette[index % Math.max(1, bundle.style.palette.length)]));
+    this.terrainMaterialColors.clear();
+    if (bundle.terrain?.kind === 'compiled-heightfield') bundle.terrain.materialSets.forEach((material, index) => this.terrainMaterialColors.set(material.id, biomeColor(material.biome, bundle.style.palette[index % Math.max(1, bundle.style.palette.length)])));
     this.terrainFeatures = bundle.features;
     this.scene.background = this.baseBackground.clone();
     this.scene.fog = new THREE.FogExp2(0xa9bdc2, this.baseFogDensity);
     this.scene.environment = null;
     this.installTerrainSurfaceTextures();
+    await this.installCompiledTerrainTextures(bundle);
     this.currentTimeOfDay = bundle.environment.timeOfDay;
     this.installLights(this.currentTimeOfDay);
     this.installWeather(bundle.environment.weather);
@@ -445,6 +453,7 @@ export class ThreeRendererBackend implements RendererBackend {
     textures.forEach((texture) => texture.dispose());
     materials.forEach((material) => material.dispose());
     this.gltfAssets.clear();
+    this.disposeCompiledTerrainTextures();
     this.ktx2Loader.dispose();
     this.disposeWeather();
     if (this.water) {
@@ -594,6 +603,46 @@ export class ThreeRendererBackend implements RendererBackend {
     this.resources.touch('terrain-surface-textures', 'texture', detail.byteLength + normals.byteLength, this.frameIndex, true);
   }
 
+  private disposeCompiledTerrainTextures(): void {
+    for (const textures of this.terrainPbrTextures.values()) {
+      textures.baseColor.dispose();
+      textures.normal.dispose();
+      textures.roughness.dispose();
+    }
+    this.terrainPbrTextures.clear();
+    this.resources.remove('compiled-terrain-textures');
+  }
+
+  private async installCompiledTerrainTextures(bundle: VisualWorldBundle): Promise<void> {
+    this.disposeCompiledTerrainTextures();
+    if (bundle.terrain?.kind !== 'compiled-heightfield') return;
+    const ktx2Materials = bundle.terrain.materialSets.filter((material) => [material.baseColorUri, material.normalUri, material.roughnessUri].every((uri) => uri.toLowerCase().endsWith('.ktx2')));
+    if (ktx2Materials.length === 0) return;
+    if (!this.renderer) throw new Error('Initialize the renderer before loading compiled KTX2 terrain textures');
+    let estimatedBytes = 0;
+    await Promise.all(ktx2Materials.map(async (material) => {
+      const [baseColor, normal, roughness] = await Promise.all([
+        this.ktx2Loader.loadAsync(material.baseColorUri),
+        this.ktx2Loader.loadAsync(material.normalUri),
+        this.ktx2Loader.loadAsync(material.roughnessUri),
+      ]);
+      const repeat = Math.max(1, bundle.chunkSize / material.metersPerTile);
+      for (const texture of [baseColor, normal, roughness]) {
+        texture.wrapS = THREE.RepeatWrapping;
+        texture.wrapT = THREE.RepeatWrapping;
+        texture.repeat.set(repeat, repeat);
+        texture.anisotropy = 4;
+        const image = texture.image as { width?: number; height?: number } | undefined;
+        estimatedBytes += Math.round((image?.width ?? 128) * (image?.height ?? 128) * 1.34);
+      }
+      baseColor.colorSpace = THREE.SRGBColorSpace;
+      normal.colorSpace = THREE.NoColorSpace;
+      roughness.colorSpace = THREE.NoColorSpace;
+      this.terrainPbrTextures.set(material.id, { baseColor, normal, roughness });
+    }));
+    this.resources.touch('compiled-terrain-textures', 'texture', estimatedBytes, this.frameIndex, true);
+  }
+
   private async createTerrain(chunk: RuntimeChunk): Promise<THREE.Group> {
     let taskStarted = performance.now();
     const sourceSamples = chunk.terrain.samples;
@@ -621,7 +670,11 @@ export class ThreeRendererBackend implements RendererBackend {
         const index = sampleZ * renderSamples + sampleX;
         const sourceIndex = (sampleZ * sourceStep) * sourceSamples + sampleX * sourceStep;
         const regionIndex = chunk.terrain.biomeWeights?.[sourceIndex] ?? 255;
-        const base = (this.terrainRegionColors[regionIndex] ?? fallbackColor).clone();
+        const materialWeights = (chunk.terrain.materialSplats ?? []).map((splat) => ({ color: this.terrainMaterialColors.get(splat.materialSetId), weight: splat.weights[sourceIndex] ?? 0 })).filter((entry) => entry.color && entry.weight > 0);
+        const materialWeightTotal = materialWeights.reduce((sum, entry) => sum + entry.weight, 0);
+        const base = materialWeightTotal > 0 ? materialWeights.reduce((color, entry) => {
+          const amount = entry.weight / materialWeightTotal; color.r += entry.color!.r * amount; color.g += entry.color!.g * amount; color.b += entry.color!.b * amount; return color;
+        }, new THREE.Color(0, 0, 0)) : (this.terrainRegionColors[regionIndex] ?? fallbackColor).clone();
         const heightFactor = (heights[index]! - chunk.terrain.minHeight) / range;
         const left = heights[sampleZ * renderSamples + Math.max(0, sampleX - 1)]!;
         const right = heights[sampleZ * renderSamples + Math.min(renderSamples - 1, sampleX + 1)]!;
@@ -660,13 +713,16 @@ export class ThreeRendererBackend implements RendererBackend {
     const levels = plan.levels.map(({ distance, start, count }) => ({ distance, start, count }));
     geometry.setIndex(plan.indices);
     geometry.setDrawRange(levels[0]!.start, levels[0]!.count);
+    const dominantMaterialId = (chunk.terrain.materialSplats ?? []).map((splat) => ({ id: splat.materialSetId, weight: splat.weights.reduce((sum, weight) => sum + weight, 0) })).sort((left, right) => right.weight - left.weight)[0]?.id;
+    const compiledTextures = dominantMaterialId ? this.terrainPbrTextures.get(dominantMaterialId) : undefined;
     const material = new THREE.MeshStandardMaterial({
       color: 0xffffff,
       vertexColors: true,
       roughness: 0.93,
       metalness: 0,
-      map: this.terrainDetail ?? null,
-      normalMap: this.terrainNormal ?? null,
+      map: compiledTextures?.baseColor ?? this.terrainDetail ?? null,
+      normalMap: compiledTextures?.normal ?? this.terrainNormal ?? null,
+      roughnessMap: compiledTextures?.roughness ?? null,
       normalScale: new THREE.Vector2(0.16, 0.16),
     });
     const mesh = new THREE.Mesh(geometry, material);

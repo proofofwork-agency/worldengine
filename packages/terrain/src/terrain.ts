@@ -5,7 +5,7 @@ export interface TerrainGenerationOptions {
   coordinate: ChunkCoordinate;
   chunkSize: number;
   samples: number;
-  source: TerrainSource;
+  source: Extract<TerrainSource, { kind: 'procedural' }>;
 }
 
 export interface GeneratedTerrain {
@@ -14,7 +14,7 @@ export interface GeneratedTerrain {
   maxHeight: number;
 }
 
-export function sampleTerrainHeight(source: TerrainSource, worldX: number, worldZ: number): number {
+export function sampleTerrainHeight(source: Extract<TerrainSource, { kind: 'procedural' }>, worldX: number, worldZ: number): number {
   const broad = fbm2(source.seed, worldX * source.frequency, worldZ * source.frequency, 5);
   const detail = fbm2(source.seed ^ 0xa5a5a5a5, worldX * source.frequency * 3.7, worldZ * source.frequency * 3.7, 3);
   let height = (broad * 0.82 + detail * 0.18) * source.amplitude;

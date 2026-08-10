@@ -288,10 +288,14 @@ function building(kind: string): PrimitiveVisual {
     { geometry: new THREE.BoxGeometry(2.5, 1.7, 0.25), color: palette.timberDark, position: [-1.35, 1.6, 0] },
   ]);
   if (kind === 'cottage') return model([
-    { geometry: new THREE.BoxGeometry(6, 3.8, 5), color: palette.plaster, position: [0, 1.9, 0] },
-    { geometry: new THREE.ConeGeometry(4.6, 3.2, 4), color: palette.roof, position: [0, 5.15, 0], rotation: [0, Math.PI / 4, 0] },
+    { geometry: new THREE.BoxGeometry(7.2, 0.55, 5.8), color: palette.stoneDark, position: [0, 0.275, 0] },
+    { geometry: new THREE.BoxGeometry(6.6, 3.8, 5.2), color: palette.plaster, position: [0, 2.15, 0] },
+    { geometry: new THREE.ConeGeometry(5, 3.1, 4), color: palette.roof, position: [0, 5.6, 0], rotation: [0, Math.PI / 4, 0], scale: [1, 1, 0.82] },
     { geometry: new THREE.BoxGeometry(1.25, 2.2, 0.28), color: palette.timberDark, position: [0, 1.1, 2.62] },
     { geometry: new THREE.BoxGeometry(0.9, 1.15, 0.25), color: palette.accent, position: [-1.8, 2.3, 2.63] },
+    { geometry: new THREE.BoxGeometry(0.26, 3.7, 0.3), color: palette.timberDark, position: [-2.75, 2.1, 2.7] },
+    { geometry: new THREE.BoxGeometry(0.26, 3.7, 0.3), color: palette.timberDark, position: [2.75, 2.1, 2.7] },
+    { geometry: new THREE.BoxGeometry(6, 0.24, 0.32), color: palette.timber, position: [0, 3.55, 2.7] },
     { geometry: new THREE.BoxGeometry(0.7, 2.5, 0.7), color: palette.stoneDark, position: [1.75, 5.4, -0.8] },
   ]);
   if (kind === 'watchtower') return model([
@@ -306,6 +310,7 @@ function building(kind: string): PrimitiveVisual {
   ]);
   if (kind === 'bridge') return model([
     ...Array.from({ length: 10 }, (_, index): Part => ({ geometry: new THREE.BoxGeometry(1.05, 0.25, 3.4), color: index % 2 ? palette.timber : palette.timberDark, position: [index - 4.5, 1 + Math.sin((index / 9) * Math.PI) * 1.5, 0], rotation: [0, 0, Math.cos((index / 9) * Math.PI) * -0.22] })),
+    ...Array.from({ length: 6 }, (_, index) => [-1, 1].map((side): Part => ({ geometry: new THREE.CylinderGeometry(0.12, 0.18, 2.5, 7), color: palette.timberDark, position: [-4.5 + index * 1.8, 2.05 + Math.sin((index / 5) * Math.PI) * 1.2, side * 1.5] }))).flat(),
     { geometry: new THREE.BoxGeometry(10.5, 0.22, 0.22), color: palette.timberDark, position: [0, 3, 1.5] },
     { geometry: new THREE.BoxGeometry(10.5, 0.22, 0.22), color: palette.timberDark, position: [0, 3, -1.5] },
   ]);

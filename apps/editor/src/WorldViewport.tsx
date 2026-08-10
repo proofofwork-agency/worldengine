@@ -45,15 +45,25 @@ export function WorldViewport({ tool, mode, timeOfDay, weather, terrainEdits, re
   const sourceRef = useRef<ProceduralWorldBundleSource | undefined>(undefined);
   const worldRef = useRef<VisualWorld | undefined>(undefined);
   const revisionRef = useRef(0);
-  const homeInstance = bundle.authoredInstances.reduce<(typeof bundle.authoredInstances)[number] | undefined>((best, candidate) => {
+  const homeInstance = bundle.authoredInstances.find((candidate) => candidate.visualState['home'] === true)
+    ?? bundle.authoredInstances.find((candidate) => {
+      const prototype = bundle.prototypes.find((entry) => entry.id === candidate.prototypeId);
+      return prototype?.tags.includes('bridge') === true;
+    })
+    ?? bundle.authoredInstances.reduce<(typeof bundle.authoredInstances)[number] | undefined>((best, candidate) => {
     if (!best) return candidate;
     const bestRadius = bundle.prototypes.find((prototype) => prototype.id === best.prototypeId)?.boundsRadius ?? 0;
     const candidateRadius = bundle.prototypes.find((prototype) => prototype.id === candidate.prototypeId)?.boundsRadius ?? 0;
     return candidateRadius > bestRadius ? candidate : best;
   }, undefined);
   const homeMatrix = homeInstance?.matrix;
-  const homeFocusRef = useRef<[number, number, number]>(homeMatrix ? [homeMatrix[12], homeMatrix[13], homeMatrix[14]] : [0, 0, 0]);
-  const navigationStateRef = useRef<{ yaw: number; pitch: number; distance: number; focus: [number, number, number] }>({ yaw: -0.65, pitch: 0.6, distance: 620, focus: [...homeFocusRef.current] });
+  const homePrototype = homeInstance ? bundle.prototypes.find((entry) => entry.id === homeInstance.prototypeId) : undefined;
+  const homeFocusRef = useRef<[number, number, number]>(homeMatrix
+    ? homePrototype?.tags.includes('bridge') === true
+      ? [homeMatrix[12] + 58, homeMatrix[13] + 5, homeMatrix[14] + 74]
+      : [homeMatrix[12], homeMatrix[13] + 4, homeMatrix[14]]
+    : [0, 0, 0]);
+  const navigationStateRef = useRef<{ yaw: number; pitch: number; distance: number; focus: [number, number, number] }>({ yaw: -2.235, pitch: 0.1, distance: 150, focus: [...homeFocusRef.current] });
   const interactionRef = useRef({ tool, onSelectEntity, onTerrainBrush, onRegionBrush });
   modeRef.current = mode;
   timeRef.current = timeOfDay;
@@ -141,7 +151,7 @@ export function WorldViewport({ tool, mode, timeOfDay, weather, terrainEdits, re
         }
       }
     };
-    const wheel = (event: WheelEvent) => { event.preventDefault(); distance = Math.max(80, Math.min(1800, distance * Math.exp(event.deltaY * 0.001))); navigationState.distance = distance; };
+    const wheel = (event: WheelEvent) => { event.preventDefault(); distance = Math.max(35, Math.min(1800, distance * Math.exp(event.deltaY * 0.001))); navigationState.distance = distance; };
     const isTypingTarget = (target: EventTarget | null): boolean => target instanceof HTMLInputElement
       || target instanceof HTMLTextAreaElement
       || target instanceof HTMLSelectElement
@@ -155,7 +165,7 @@ export function WorldViewport({ tool, mode, timeOfDay, weather, terrainEdits, re
       if (event.code === 'KeyR') {
         event.preventDefault();
         focusPosition.splice(0, 3, ...homeFocusRef.current);
-        yaw = -0.65; pitch = 0.6; distance = 620;
+        yaw = -2.235; pitch = 0.1; distance = 150;
         navigationState.yaw = yaw; navigationState.pitch = pitch; navigationState.distance = distance;
       }
     };

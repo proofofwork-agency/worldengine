@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { PatchIdSchema, RegionIdSchema } from '@worldengine/schema';
-import { placeObjectFromComposition, rasterizeRegions, referenceCamerasForRegion, validateVisualReviewPatch } from './composition.js';
+import { measureCompositionPreservation, placeObjectFromComposition, rasterizeRegions, referenceCamerasForRegion, silhouetteFitMetrics, terrainContactMeasurement, validateVisualReviewPatch } from './composition.js';
 
 const region = {
   id: RegionIdSchema.parse('square'), name: 'Square', description: '', polygon: [[-50,-50],[50,-50],[50,50],[-50,50]] as [number, number][],
@@ -28,5 +28,18 @@ describe('regional composition', () => {
     expect(() => validateVisualReviewPatch({ ...valid, baseRevision: 1 }, 'world', 2)).toThrow('stale');
     const structural = { ...valid, id: PatchIdSchema.parse('review-structural'), baseRevision: 2, operations: [{ op: 'invalidate-chunk' as const, chunkId: '0:0' }] };
     expect(() => validateVisualReviewPatch(structural, 'world', 2)).toThrow('may only adjust');
+  });
+
+  it('enforces composition, silhouette, camera and terrain-contact thresholds', () => {
+    const source = new Uint8Array(4 * 4 * 4).fill(120); const candidate = new Uint8Array(source);
+    for (let channel = 0; channel < 3; channel += 1) candidate[(1 * 4 + 1) * 4 + channel] = 255;
+    const terrainMask = new Uint8Array(16).fill(255);
+    expect(measureCompositionPreservation({ sourceRgba: source, candidateRgba: candidate, width: 4, height: 4, objectBoxes: [{ x: 1, y: 1, width: 1, height: 1 }], sourceTerrainMask: terrainMask, candidateTerrainMask: terrainMask, sourceLandmarks: [[1, 1]], candidateLandmarks: [[5, 1]] })).toMatchObject({ passed: true, structuralSimilarityOutsideObjects: 1, terrainMaskOverlap: 1, cameraLandmarkDriftPixels: 4 });
+    expect(measureCompositionPreservation({ sourceRgba: source, candidateRgba: candidate, width: 4, height: 4, sourceLandmarks: [[1, 1]], candidateLandmarks: [[10, 1]] }).passed).toBe(false);
+    const silhouette = new Uint8Array(16); silhouette.set([255, 255], 5);
+    expect(silhouetteFitMetrics(silhouette, new Uint8Array(silhouette), 4, 4)).toMatchObject({ iou: 1, centerErrorPixels: 0, passed: true });
+    expect(terrainContactMeasurement([[0, 0.019, 0]], () => 0, false).passed).toBe(true);
+    expect(terrainContactMeasurement([[0, 0.03, 0]], () => 0, false).passed).toBe(false);
+    expect(terrainContactMeasurement([[0, 0.049, 0]], () => 0, true).passed).toBe(true);
   });
 });

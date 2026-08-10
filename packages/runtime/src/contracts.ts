@@ -35,6 +35,8 @@ export interface RuntimeTerrain {
   minHeight: number;
   maxHeight: number;
   biomeWeights?: Uint8Array;
+  materialSplats: Array<{ materialSetId: string; weights: Uint8Array }>;
+  textureDependencies: string[];
 }
 
 export interface RuntimeChunk extends Omit<RuntimeChunkDocument, 'terrain'> {

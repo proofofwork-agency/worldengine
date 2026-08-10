@@ -35,6 +35,24 @@ describe('provider policy gate', () => {
     expect(() => assertCostBudget(request(), 2.01)).toThrow('exceeds cap');
   });
 
+  it('reserves only the three generated side views because the isolated image is reused as front', () => {
+    const profile = (provider: string, modelId: string, usd: number): ProviderTermsProfile => ({ ...accepted, provider, modelId, cost: { unit: 'request', usd } });
+    const terra = profile('openrouter', 'terra', 0.25);
+    const image = profile('openrouter-image', 'image', 0.211);
+    const sam = profile('sam2-local', 'sam2', 0);
+    const wavespeed = profile('wavespeed', 'multiview', 0.5);
+    const selection = (source: ProviderTermsProfile, role: 'planner' | 'reviewer' | 'composition-image' | 'object-detection' | 'segmentation' | 'multiview-image' | 'image-to-3d') => ({
+      provider: source.provider, modelId: source.modelId, revision: source.revision, termsFingerprint: source.termsFingerprint, role,
+    });
+    const studio = CompileRequestSchema.parse({
+      prompt: 'hero', seed: 2, qualityProfile: 'studio', heroRegionIds: ['region-1'], maxCostUsd: 25, maxAssetGenerations: 8, maxReferenceImages: 1,
+      territory: 'NL', commercialUse: true, dryRun: false,
+      refinementPolicy: { maxTerrainRounds: 3, maxCompositionAttempts: 3, maxAssetAttempts: 2, maxSceneRounds: 3, maxAssetRepairRounds: 2, maxSceneRepairRounds: 1, terrainCoDeformation: true },
+      providerModels: [selection(terra, 'planner'), selection(terra, 'reviewer'), selection(image, 'composition-image'), selection(terra, 'object-detection'), selection(sam, 'segmentation'), selection(image, 'multiview-image'), selection(wavespeed, 'image-to-3d')],
+    });
+    expect(new ProviderPolicyRegistry([terra, image, sam, wavespeed]).estimateMaximumCost(studio)).toBeCloseTo(23.449, 6);
+  });
+
   it('rejects an enabled profile whose terms fingerprint is still a placeholder', () => {
     const placeholder = { ...accepted, termsFingerprint: 'UNREVIEWED_REPLACE_WITH_SHA256' };
     const registry = new ProviderPolicyRegistry([placeholder]);

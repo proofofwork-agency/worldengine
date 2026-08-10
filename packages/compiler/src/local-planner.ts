@@ -1,5 +1,6 @@
 import { RegionIdSchema, WorldDesignSpecSchema, type CompileRequest, type WorldDesignSpec } from '@worldengine/schema';
 import { createReferenceDesignSpec } from '@worldengine/terrain';
+import { calibrateReferenceCamera, referenceCamerasForRegion } from './composition.js';
 
 interface ThemeProfile {
   title: string;
@@ -48,6 +49,56 @@ const themes: ThemeProfile[] = [
 ];
 
 function promptMentions(prompt: string, expression: RegExp): boolean { return expression.test(prompt); }
+
+function operatorsForBiome(biome: string, index: number) {
+  const offset = [index * 173 - 346, index * -137 + 274] as [number, number];
+  if (/highland|mountain|mesa|alpine|ridge/.test(biome)) return [
+    { kind: 'ridge' as const, strength: 0.92, scaleMeters: 720, octaves: 5, offset },
+    { kind: 'erosion' as const, strength: 0.24, scaleMeters: 250, octaves: 4, offset },
+  ];
+  if (/dune|desert|arid/.test(biome)) return [
+    { kind: 'dune' as const, strength: 0.68, scaleMeters: 190, octaves: 4, offset },
+    { kind: 'plateau' as const, strength: 0.18, scaleMeters: 880, octaves: 3, offset },
+  ];
+  if (/caldera|volcan/.test(biome)) return [
+    { kind: 'peak' as const, strength: 0.9, scaleMeters: 840, octaves: 5, offset },
+    { kind: 'terrace' as const, strength: 0.24, scaleMeters: 430, octaves: 4, offset, terraceSteps: 9 },
+  ];
+  if (/wetland|coast|basin|plain|settlement/.test(biome)) return [
+    { kind: 'plateau' as const, strength: 0.25, scaleMeters: 850, octaves: 4, offset },
+    { kind: 'riverbed' as const, strength: 0.12, scaleMeters: 460, octaves: 4, offset },
+  ];
+  return [
+    { kind: 'terrace' as const, strength: 0.45, scaleMeters: 760, octaves: 5, offset, terraceSteps: 12 },
+    { kind: 'erosion' as const, strength: 0.2, scaleMeters: 260, octaves: 4, offset },
+  ];
+}
+
+export function buildExecutableTerrainPlan(regions: WorldDesignSpec['regions'], features: WorldDesignSpec['features'], assets: string[]) {
+  const materialSets = regions.map((region) => ({
+    id: `material-${region.id}`,
+    name: `${region.name} PBR terrain`,
+    biome: region.biome,
+    baseColorUri: `terrain-material://${region.id}/base-color.ktx2`,
+    normalUri: `terrain-material://${region.id}/normal.ktx2`,
+    roughnessUri: `terrain-material://${region.id}/roughness.ktx2`,
+    macroVariationUri: `terrain-material://${region.id}/macro-variation.ktx2`,
+    metersPerTile: /dune|desert|snow|ice/.test(region.biome) ? 7 : 4,
+  }));
+  return {
+    schemaVersion: '1.0.0' as const,
+    maskBlendMeters: 180,
+    regions: regions.map((region, index) => ({ regionId: region.id, operators: operatorsForBiome(region.biome, index), materialSetIds: [`material-${region.id}`] })),
+    materialSets,
+    scatterRecipes: regions.map((region) => ({
+      id: `scatter-${region.id}`, regionId: region.id, prototypeClasses: assets.slice(0, 8), densityPerSquareKm: Math.round(220 + region.density * 1_100),
+      slopeDegrees: { min: 0, max: /highland|mountain|alpine/.test(region.biome) ? 62 : 38 }, waterDistanceMeters: { min: 0, max: 10_000 },
+      roadDistanceMeters: { min: 0, max: 10_000 }, scaleRange: [0.8, 1.25] as [number, number], yawJitterDegrees: 180,
+    })),
+    featureIds: features.map((feature) => feature.id),
+    referenceCameras: regions.flatMap((region) => referenceCamerasForRegion(region, 3).map((camera) => calibrateReferenceCamera(camera, region.id))),
+  };
+}
 
 export function planLocalWorldDesign(request: CompileRequest): WorldDesignSpec {
   if (request.designSpec) return WorldDesignSpecSchema.parse(request.designSpec);
@@ -101,6 +152,7 @@ export function planLocalWorldDesign(request: CompileRequest): WorldDesignSpec {
     features,
     landmarks: [],
     assetRequirements: theme.assets.map((assetClass) => ({ class: assetClass, count: 1, sourcePreference: ['library', 'cache', 'generate'], tags: [theme.biomes[0]!] })),
+    terrainPlan: buildExecutableTerrainPlan(regions, features, theme.assets),
     defaultsApplied,
   });
 }

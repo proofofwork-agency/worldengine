@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { CompileRequestSchema, type CompileEvent, type CompileRequest, type VisualWorldBundle } from '@worldengine/schema';
+import { CompileRequestSchema, GenerationArtifactSchema, GenerationAttemptSchema, RefinementDecisionSchema, type CompileEvent, type CompileRequest, type GenerationArtifact, type GenerationAttempt, type RefinementAction, type RefinementDecision, type VisualWorldBundle } from '@worldengine/schema';
 import type { DagCheckpointStore, DagNodeResult } from '@worldengine/compiler';
 
 export interface JobSummary { id: string; status: string; request: CompileRequest; createdAt: string; updatedAt: string }
@@ -50,6 +50,24 @@ export class JobLedger implements DagCheckpointStore {
         received_at TEXT NOT NULL,
         PRIMARY KEY (provider, event_id)
       );
+      CREATE TABLE IF NOT EXISTS compile_artifacts (
+        compile_id TEXT NOT NULL,
+        artifact_id TEXT NOT NULL,
+        artifact_json TEXT NOT NULL,
+        PRIMARY KEY (compile_id, artifact_id)
+      );
+      CREATE TABLE IF NOT EXISTS generation_attempts (
+        compile_id TEXT NOT NULL,
+        attempt_id TEXT NOT NULL,
+        attempt_json TEXT NOT NULL,
+        PRIMARY KEY (compile_id, attempt_id)
+      );
+      CREATE TABLE IF NOT EXISTS refinement_decisions (
+        compile_id TEXT NOT NULL,
+        decision_id TEXT NOT NULL,
+        decision_json TEXT NOT NULL,
+        PRIMARY KEY (compile_id, decision_id)
+      );
     `);
   }
 
@@ -64,6 +82,36 @@ export class JobLedger implements DagCheckpointStore {
       .run(event.compileId, event.sequence, JSON.stringify(event));
     this.database.prepare('UPDATE jobs SET status = ?, updated_at = ? WHERE id = ?')
       .run(event.type, event.timestamp, event.compileId);
+    if (event.type === 'cost') {
+      const providerAttempts = event.data['providerAttempts'];
+      if (Array.isArray(providerAttempts)) for (const raw of providerAttempts) {
+        const attempt = GenerationAttemptSchema.parse(raw);
+        if (attempt.compileId !== event.compileId) throw new Error(`Provider attempt ${attempt.id} belongs to a different compile`);
+        this.recordAttempt(attempt);
+      }
+    }
+    if (event.type === 'progress' || event.type === 'failed' || event.type === 'needs-attention' || event.type === 'cancelled' || event.type === 'completed') {
+      const phase = event.phase === 'visual-review' ? 'review' : event.phase === 'composition' ? 'composition' : event.phase === 'placement' ? 'placement' : event.phase === 'terrain' ? 'terrain' : event.phase === 'optimization' ? 'asset-validation' : event.phase === 'complete' ? 'publication' : 'review';
+      const silhouetteFailure = event.phase === 'region-refinement' && /silhouette/i.test(event.message);
+      const plannedAction: RefinementAction | undefined = event.type === 'needs-attention' ? {
+        id: `repair-${event.sequence}-${event.phase ?? 'review'}`,
+        type: event.phase === 'region-map' || event.phase === 'requirements' ? 'regenerate-composition' : silhouetteFailure ? 'reconstruct-mesh' : event.phase === 'region-refinement' ? 'fit-support' : event.phase === 'optimization' ? 'reconstruct-mesh' : 'rerender',
+        targetId: event.phase ?? 'compile', parameters: {}, reservedCostUsd: 0, reason: event.message,
+      } : undefined;
+      const attempt = GenerationAttemptSchema.parse({
+        id: `attempt-${event.sequence}-${phase}`, compileId: event.compileId, phase, index: event.sequence,
+        status: event.type === 'progress' || event.type === 'completed' ? 'passed' : event.type === 'needs-attention' ? 'rejected' : event.type,
+        reservedCostUsd: 0, actualCostUsd: 0, artifactIds: [], ...(event.type === 'failed' || event.type === 'needs-attention' ? { rejectionReason: event.message } : {}),
+        ...(plannedAction ? { plannedAction } : {}),
+        startedAt: event.timestamp, completedAt: event.timestamp,
+      });
+      this.recordAttempt(attempt);
+      if (plannedAction) this.recordDecision(RefinementDecisionSchema.parse({
+        id: `decision-${event.sequence}-${event.phase ?? 'review'}`, compileId: event.compileId, attemptId: attempt.id, approved: false,
+        diagnosis: [{ code: silhouetteFailure ? 'silhouette-mismatch' : event.phase === 'region-refinement' ? 'floating' : event.phase === 'optimization' ? 'mesh-invalid' : event.phase === 'region-map' || event.phase === 'requirements' ? 'composition-drift' : 'environment-mismatch', severity: 'error', targetId: event.phase ?? 'compile', message: event.message }],
+        actions: [plannedAction], createdAt: event.timestamp,
+      }));
+    }
   }
 
   events(id: string): CompileEvent[] {
@@ -86,7 +134,59 @@ export class JobLedger implements DagCheckpointStore {
   }
 
   recoverableJobs(): JobSummary[] {
-    return this.listJobs(200).filter((job) => !['completed', 'failed', 'cancelled'].includes(job.status));
+    return this.listJobs(200).filter((job) => !['completed', 'failed', 'needs-attention', 'cancelled'].includes(job.status));
+  }
+
+  resumeJob(id: string, request: CompileRequest): void {
+    const timestamp = new Date().toISOString();
+    const result = this.database.prepare('UPDATE jobs SET status = ?, request_json = ?, updated_at = ? WHERE id = ?').run('queued', JSON.stringify(request), timestamp, id);
+    if (result.changes !== 1) throw new Error(`Compile ${id} does not exist`);
+  }
+
+  resetDag(runId: string): void {
+    this.database.prepare('DELETE FROM dag_nodes WHERE run_id = ?').run(runId);
+  }
+
+  recordArtifact(artifactInput: GenerationArtifact): void {
+    const artifact = GenerationArtifactSchema.parse(artifactInput);
+    this.database.prepare('INSERT OR REPLACE INTO compile_artifacts (compile_id, artifact_id, artifact_json) VALUES (?, ?, ?)').run(artifact.compileId, artifact.id, JSON.stringify(artifact));
+  }
+
+  artifacts(compileId: string): GenerationArtifact[] {
+    const rows = this.database.prepare('SELECT artifact_json FROM compile_artifacts WHERE compile_id = ? ORDER BY artifact_id').all(compileId) as Array<{ artifact_json: string }>;
+    return rows.map((row) => GenerationArtifactSchema.parse(JSON.parse(row.artifact_json)));
+  }
+
+  artifact(compileId: string, artifactId: string): GenerationArtifact | undefined {
+    const row = this.database.prepare('SELECT artifact_json FROM compile_artifacts WHERE compile_id = ? AND artifact_id = ?').get(compileId, artifactId) as { artifact_json: string } | undefined;
+    return row ? GenerationArtifactSchema.parse(JSON.parse(row.artifact_json)) : undefined;
+  }
+
+  recordAttempt(attemptInput: GenerationAttempt): void {
+    const attempt = GenerationAttemptSchema.parse(attemptInput);
+    this.database.prepare('INSERT OR REPLACE INTO generation_attempts (compile_id, attempt_id, attempt_json) VALUES (?, ?, ?)').run(attempt.compileId, attempt.id, JSON.stringify(attempt));
+  }
+
+  attempts(compileId: string): GenerationAttempt[] {
+    const rows = this.database.prepare('SELECT attempt_json FROM generation_attempts WHERE compile_id = ? ORDER BY attempt_id').all(compileId) as Array<{ attempt_json: string }>;
+    return rows.map((row) => GenerationAttemptSchema.parse(JSON.parse(row.attempt_json)));
+  }
+
+  recordDecision(decisionInput: RefinementDecision): void {
+    const decision = RefinementDecisionSchema.parse(decisionInput);
+    this.database.prepare('INSERT OR REPLACE INTO refinement_decisions (compile_id, decision_id, decision_json) VALUES (?, ?, ?)').run(decision.compileId, decision.id, JSON.stringify(decision));
+  }
+
+  decisions(compileId: string): RefinementDecision[] {
+    const rows = this.database.prepare('SELECT decision_json FROM refinement_decisions WHERE compile_id = ? ORDER BY decision_id').all(compileId) as Array<{ decision_json: string }>;
+    return rows.map((row) => RefinementDecisionSchema.parse(JSON.parse(row.decision_json)));
+  }
+
+  nodeOutput<T = unknown>(runId: string, nodeId: string): T | undefined {
+    const row = this.database.prepare('SELECT result_json FROM dag_nodes WHERE run_id = ? AND node_id = ?').get(runId, nodeId) as { result_json: string } | undefined;
+    if (!row) return undefined;
+    const result = JSON.parse(row.result_json) as DagNodeResult;
+    return result.status === 'completed' ? result.output as T : undefined;
   }
 
   latestSequence(id: string): number {

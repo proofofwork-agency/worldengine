@@ -5,6 +5,7 @@ import {
   PrototypeIdSchema,
   RegionIdSchema,
   VisualWorldBundleSchema,
+  WorldDesignSpecSchema,
   chunkId,
   type AssetLibraryEntry,
   type AuthoringEntity,
@@ -19,10 +20,11 @@ import {
   type VisualWorldBundle,
   type WorldDesignSpec,
 } from '@worldengine/schema';
-import { generateReferenceChunk, hash32, sampleWorldHeight } from '@worldengine/terrain';
+import { compileTerrainPlanChunk, generateReferenceChunk, hash32, sampleWorldHeight } from '@worldengine/terrain';
 import { isSafeAssetUri } from './asset-validation.js';
 import { placeObjectFromComposition, referenceCamerasForRegion, type ObjectDescriptor } from './composition.js';
 import { effectiveQualityProfile } from './quality-profile.js';
+import { buildExecutableTerrainPlan } from './local-planner.js';
 
 export interface CompiledWorldArtifacts {
   designSpec: WorldDesignSpec;
@@ -40,6 +42,17 @@ export interface AuthoringCompileOptions {
 
 function slug(value: string): string {
   return value.toLowerCase().replace(/[^a-z\d]+/g, '-').replace(/(^-|-$)/g, '').slice(0, 80) || 'world';
+}
+
+function regionAt(spec: WorldDesignSpec, x: number, z: number): WorldDesignSpec['regions'][number] | undefined {
+  return spec.regions.find((region) => {
+    let inside = false;
+    for (let current = 0, previous = region.polygon.length - 1; current < region.polygon.length; previous = current++) {
+      const a = region.polygon[current]!; const b = region.polygon[previous]!;
+      if ((a[1] > z) !== (b[1] > z) && x < ((b[0] - a[0]) * (z - a[1])) / (b[1] - a[1]) + a[0]) inside = !inside;
+    }
+    return inside;
+  });
 }
 
 export function boundsRadiusForAssetClass(assetClass: string): number {
@@ -204,20 +217,29 @@ function compileBundle(spec: WorldDesignSpec, authoring: AuthoringWorld, created
   const minChunkZ = Math.floor(spec.bounds.min[1] / spec.chunkSize);
   const maxChunkZ = Math.ceil(spec.bounds.max[1] / spec.chunkSize) - 1;
   const terrainRange = spec.regions.reduce((range, region) => ({ min: Math.min(range.min, region.elevation.min), max: Math.max(range.max, region.elevation.max) }), { min: 0, max: 0 });
+  const compiledTerrain = authoring.terrain.kind === 'compiled-heightfield' ? authoring.terrain : undefined;
   const contentBasis = JSON.stringify({ seed: spec.seed, regions: spec.regions, features: spec.features, prototypes: runtimePrototypes.map((prototype) => [prototype.id, prototype.contentHash]) });
   const chunks = [];
   for (let z = minChunkZ; z <= maxChunkZ; z += 1) for (let x = minChunkX; x <= maxChunkX; x += 1) chunks.push({
     id: chunkId(x, z),
     coordinate: { x, z },
     bounds: { min: [x * spec.chunkSize, z * spec.chunkSize] as [number, number], max: [(x + 1) * spec.chunkSize, (z + 1) * spec.chunkSize] as [number, number] },
-    source: { kind: 'procedural' as const, seed: hash32(spec.seed, x, z), generator: 'worldengine-terrain-v1' as const, contentHash: createHash('sha256').update(`${contentBasis}:${x}:${z}`).digest('hex') },
+    source: compiledTerrain ? {
+      kind: 'compiled-heightfield' as const,
+      seed: hash32(spec.seed, x, z),
+      generator: 'worldengine-terrain-v2' as const,
+      contentHash: createHash('sha256').update(`compiled:${contentBasis}:${x}:${z}`).digest('hex'),
+      heightfieldDependency: compiledTerrain.heightfieldUri,
+      splatDependencies: compiledTerrain.splatMapUris,
+      textureDependencies: compiledTerrain.materialSets.flatMap((material) => [material.baseColorUri, material.normalUri, material.roughnessUri, material.macroVariationUri]),
+    } : { kind: 'procedural' as const, seed: hash32(spec.seed, x, z), generator: 'worldengine-terrain-v1' as const, contentHash: createHash('sha256').update(`${contentBasis}:${x}:${z}`).digest('hex') },
     dependencies: [] as string[],
   });
   let bundle = VisualWorldBundleSchema.parse({
-    format: 'VisualWorldBundle', version: '1.1.0', id: `${worldId}-v1`, worldId, bundleVersion: 1, immutable: true, createdAt,
+    format: 'VisualWorldBundle', version: '1.2.0', id: `${worldId}-v1`, worldId, bundleVersion: 1, immutable: true, createdAt,
     seed: spec.seed, coordinateSystem: 'right-handed-y-up', units: 'meters', bounds: spec.bounds, chunkSize: spec.chunkSize, terrainSamples: spec.terrainSamples,
     qualityProfile: authoring.qualityProfile,
-    terrain: { kind: 'procedural', seed: authoring.terrain.seed, amplitude: Math.max(24, (terrainRange.max - terrainRange.min) * 0.42), frequency: authoring.terrain.frequency, edits: authoring.terrain.edits },
+    terrain: authoring.terrain.kind === 'compiled-heightfield' ? authoring.terrain : { kind: 'procedural', seed: authoring.terrain.seed, amplitude: Math.max(24, (terrainRange.max - terrainRange.min) * 0.42), frequency: authoring.terrain.frequency, edits: authoring.terrain.edits },
     regions: spec.regions, features: spec.features, style: spec.style, environment: spec.environment, prototypes: runtimePrototypes, authoredInstances: authoredInstances(authoring), chunks,
     provenance: authoring.provenance, sourceRevision: authoring.revision,
     optimization: {
@@ -241,21 +263,34 @@ export function compileLocalWorldArtifacts(
   options: AuthoringCompileOptions = {},
 ): CompiledWorldArtifacts {
   const createdAt = now.toISOString();
+  const profile = effectiveQualityProfile(request);
+  if (profile === 'studio' && (spec.terrainPlan.materialSets.length === 0 || spec.terrainPlan.referenceCameras.length === 0)) {
+    spec = WorldDesignSpecSchema.parse({ ...spec, terrainPlan: buildExecutableTerrainPlan(spec.regions, spec.features, spec.assetRequirements.map((requirement) => requirement.class)) });
+  }
+  const foundationSize = Math.max(spec.bounds.max[0] - spec.bounds.min[0], spec.bounds.max[1] - spec.bounds.min[1]);
+  const compiledFoundation = profile === 'studio' ? compileTerrainPlanChunk({ plan: spec.terrainPlan, regions: spec.regions, seed: spec.seed, coordinate: { x: spec.bounds.min[0] / foundationSize, z: spec.bounds.min[1] / foundationSize }, chunkSize: foundationSize, samples: spec.terrainSamples, fallbackHeight: () => 0 }) : undefined;
+  const compiledHeightfieldHash = compiledFoundation ? createHash('sha256').update(Buffer.from(compiledFoundation.heights.buffer, compiledFoundation.heights.byteOffset, compiledFoundation.heights.byteLength)).digest('hex') : undefined;
   const { prototypes, provenance } = resolvePrototypes(spec, request, createdAt, pendingGeneratedReviewIds);
   const worldId = `world-${slug(spec.title)}-${spec.seed}`;
-  const landmarkEntities: AuthoringEntity[] = spec.landmarks.map((landmark, index) => ({
-    id: EntityIdSchema.parse(`landmark:${slug(landmark.id)}`),
-    prototypeId: prototypeForLandmark(prototypes, landmark, index).id,
-    name: landmark.name,
-    transform: { position: landmark.position, rotation: [0, 0, 0, 1], scale: [1, 1, 1] },
-    visualState: { authored: true, landmark: true },
-    locked: true,
-  }));
+  const landmarkEntities: AuthoringEntity[] = spec.landmarks.map((landmark, index) => {
+    const region = regionAt(spec, landmark.position[0], landmark.position[2]);
+    return {
+      id: EntityIdSchema.parse(`landmark:${slug(landmark.id)}`), prototypeId: prototypeForLandmark(prototypes, landmark, index).id, name: landmark.name,
+      transform: { position: landmark.position, rotation: [0, 0, 0, 1], scale: [1, 1, 1] }, ...(region ? { regionId: region.id } : {}),
+      visualState: { authored: true, landmark: true }, locked: true,
+    };
+  });
   const initial = AuthoringWorldSchema.parse({
-    format: 'AuthoringWorld', version: '1.1.0', id: `${worldId}-authoring`, designSpecId: spec.id, revision: 0, seed: spec.seed,
-    qualityProfile: effectiveQualityProfile(request),
+    format: 'AuthoringWorld', version: '1.2.0', id: `${worldId}-authoring`, designSpecId: spec.id, revision: 0, seed: spec.seed,
+    qualityProfile: profile,
     bounds: spec.bounds, chunkSize: spec.chunkSize, terrainSamples: spec.terrainSamples,
-    terrain: { kind: 'procedural', seed: spec.seed, amplitude: 72, frequency: 1 / 900, edits: [] },
+    terrain: profile === 'studio' ? {
+      kind: 'compiled-heightfield', seed: spec.seed,
+      heightfieldUri: `terrain/${compiledHeightfieldHash}.f32`,
+      contentHash: compiledHeightfieldHash,
+      samples: spec.terrainSamples, encoding: 'float32', terrainPlan: spec.terrainPlan, materialSets: spec.terrainPlan.materialSets,
+      splatMapUris: compiledFoundation!.splats.map((splat) => `terrain/${createHash('sha256').update(splat.weights).digest('hex')}.bin`), edits: [], footprintEdits: [],
+    } : { kind: 'procedural', seed: spec.seed, amplitude: 72, frequency: 1 / 900, edits: [] },
     prototypes, entities: landmarkEntities,
     regions: spec.regions.map((region) => ({ id: region.id, polygon: region.polygon, biome: region.biome, density: region.density })),
     features: spec.features,
@@ -290,6 +325,18 @@ export function compileLocalWorldArtifacts(
       });
     }
   }
+  if (profile === 'studio' && request.heroRegionIds.length > 0) {
+    const heroRegions = new Set(request.heroRegionIds);
+    const realPrototypes = prototypes.filter((prototype) => !prototype.assetUri.startsWith('primitive://'));
+    if (realPrototypes.length > 0) {
+      for (const [index, entity] of [...landmarkEntities, ...scatter].entries()) {
+        if (!entity.regionId || !heroRegions.has(entity.regionId)) continue;
+        const prototype = prototypes.find((candidate) => candidate.id === entity.prototypeId);
+        if (prototype?.assetUri.startsWith('primitive://')) entity.prototypeId = realPrototypes[hash32(spec.seed, index, entity.id.length) % realPrototypes.length]!.id;
+        entity.visualState = { ...entity.visualState, authored: true, enrichedHero: true };
+      }
+    }
+  }
   const compositionEntities: AuthoringEntity[] = [];
   const regionalCompositions = new Map<string, RegionalComposition>();
   const usedOverrides = new Set<number>();
@@ -300,10 +347,11 @@ export function compileLocalWorldArtifacts(
     if (overrideIndex >= 0) usedOverrides.add(overrideIndex);
     const region = override ? spec.regions.find((candidate) => candidate.id === override.regionId) : spec.regions[index % spec.regions.length];
     if (!region) throw new Error(`Composition override for ${prototype.name} targets unknown region ${override?.regionId}`);
+    if (profile === 'studio' && request.heroRegionIds.includes(region.id) && prototype.assetUri.startsWith('primitive://')) continue;
     // Regional concepts are rendered from this exact canonical camera. Keeping
     // every descriptor for the region on that camera makes the screen box,
     // inverse projection, terrain contact, and final review atlas one auditable chain.
-    const camera = referenceCamerasForRegion(region, 1)[0]!;
+    const camera = spec.terrainPlan.referenceCameras.find((candidate) => candidate.regionId === region.id) ?? referenceCamerasForRegion(region, 1)[0]!;
     const column = index % 4;
     const row = Math.floor(index / 4) % 3;
     const descriptor: ObjectDescriptor = override ?? {
@@ -329,11 +377,6 @@ export function compileLocalWorldArtifacts(
         locked: false,
       });
       composition.objects.push({ ...descriptor, entityId });
-      if (request.qualityProfile === 'studio' && request.refinementPolicy.terrainCoDeformation) {
-        const radius = Math.max(2, Math.max(Math.abs(prototype.bounds.min[0]), Math.abs(prototype.bounds.max[0]), Math.abs(prototype.bounds.min[2]), Math.abs(prototype.bounds.max[2])) * transform.scale[0] * 1.15);
-        initial.terrain.edits.push({ center: [transform.position[0], transform.position[2]], radius, delta: 0, mode: 'flatten', targetHeight: transform.position[1] });
-        initial.diagnostics.push({ severity: 'info', code: 'TERRAIN_OBJECT_CO_DEFORMATION', message: `Flattened terrain footprint for ${prototype.id} with ${radius.toFixed(2)}m falloff`, subjectId: prototype.id });
-      }
     } catch {
       composition.objects.push(descriptor);
       initial.diagnostics.push({ severity: 'warning', code: 'COMPOSITION_RAY_MISS', message: `Composition ray for ${prototype.id} did not intersect canonical terrain`, subjectId: prototype.id });

@@ -62,14 +62,18 @@ export class ProviderPolicyRegistry {
       const profile = this.profiles.get(this.key(requested.provider, requested.modelId, requested.revision));
       const provider = requested.provider.toLowerCase();
       const maximumInvocations = requested.role === 'planner' ? 1
-        : requested.role === 'reviewer' ? 1 + request.refinementPolicy.maxSceneRepairRounds
-          : requested.role === 'composition-image' ? request.maxReferenceImages + request.maxAssetGenerations
+        : requested.role === 'reviewer' ? 1 + request.maxReferenceImages * request.refinementPolicy.maxTerrainRounds + request.maxReferenceImages * request.refinementPolicy.maxCompositionAttempts + request.refinementPolicy.maxSceneRounds
+          : requested.role === 'composition-image' ? request.maxReferenceImages * request.refinementPolicy.maxCompositionAttempts + request.maxAssetGenerations
             : requested.role === 'object-detection' ? request.maxReferenceImages
               : requested.role === 'segmentation' ? request.maxAssetGenerations
-                : requested.role === 'multiview-image' ? request.maxAssetGenerations * 4
-                  : requested.role === 'image-to-3d' ? request.maxAssetGenerations * (1 + request.refinementPolicy.maxAssetRepairRounds)
+              // The isolated object image is reused as the front view and is
+              // already reserved under composition-image. Only left/back/right
+              // are newly generated for each reconstruction attempt.
+              : requested.role === 'multiview-image' ? request.maxAssetGenerations * 3 * request.refinementPolicy.maxAssetAttempts
+                  : requested.role === 'image-to-3d' ? request.maxAssetGenerations * request.refinementPolicy.maxAssetAttempts
                     : requested.role === 'retexture' ? request.maxAssetGenerations * request.refinementPolicy.maxAssetRepairRounds
                       : provider === 'openrouter' ? 1 + (request.maxAssetGenerations > 0 || request.maxReferenceImages > 0 ? 1 : 0)
+                        : provider === 'openrouter-image' ? request.maxAssetGenerations + request.maxReferenceImages
                         : provider === 'openai' ? request.maxAssetGenerations + request.maxReferenceImages
                           : provider === 'wavespeed' ? request.maxAssetGenerations
                             : request.maxAssetGenerations;
@@ -101,10 +105,10 @@ export const referenceProviderProfiles: ProviderTermsProfile[] = [
     retention: 'Configure zero-data-retention routing before enabling', trainingUse: 'Unreviewed', contentRestrictions: [], cost: { unit: 'request', usd: 0 }, enabled: false,
   },
   {
-    provider: 'openai', modelId: 'gpt-image-2', revision: 'operator-selects',
-    termsUrl: 'https://openai.com/policies/service-terms/', termsFingerprint: 'UNREVIEWED', reviewedAt: '2026-01-01T00:00:00.000Z', acceptedAt: null,
-    permittedTerritories: ['NONE'], commercialUse: false, notices: [], outputConditions: 'Requires operator review', retention: 'Unreviewed', trainingUse: 'Unreviewed',
-    contentRestrictions: [], cost: { unit: 'image', usd: 0 }, enabled: false,
+    provider: 'openrouter-image', modelId: 'openai/gpt-image-2', revision: 'operator-selects',
+    termsUrl: 'https://openrouter.ai/terms', termsFingerprint: 'UNREVIEWED', reviewedAt: '2026-01-01T00:00:00.000Z', acceptedAt: null,
+    permittedTerritories: ['NONE'], commercialUse: false, notices: [], outputConditions: 'Requires review of OpenRouter and the exact underlying OpenAI image-model terms',
+    retention: 'Review OpenRouter and upstream retention before enabling', trainingUse: 'Unreviewed', contentRestrictions: [], cost: { unit: 'image', usd: 0 }, enabled: false,
   },
   {
     provider: 'wavespeed', modelId: 'tripo3d/h3.1/image-to-3d', revision: 'operator-selects',
@@ -113,19 +117,13 @@ export const referenceProviderProfiles: ProviderTermsProfile[] = [
     retention: 'Download outputs immediately after generation', trainingUse: 'Unreviewed', contentRestrictions: [], cost: { unit: 'asset', usd: 0 }, enabled: false,
   },
   {
-    provider: 'tripo', modelId: 'multiview-to-model', revision: 'operator-selects',
-    termsUrl: 'https://www.tripo3d.ai/terms', termsFingerprint: 'UNREVIEWED', reviewedAt: '2026-01-01T00:00:00.000Z', acceptedAt: null,
-    permittedTerritories: ['NONE'], commercialUse: false, notices: [], outputConditions: 'Requires operator review of exact Tripo multiview revision and output rights',
+    provider: 'wavespeed', modelId: 'tripo3d/h3.1/multiview-to-3d', revision: 'operator-selects',
+    termsUrl: 'https://wavespeed.ai/models/tripo3d/h3.1/multiview-to-3d', termsFingerprint: 'UNREVIEWED', reviewedAt: '2026-01-01T00:00:00.000Z', acceptedAt: null,
+    permittedTerritories: ['NONE'], commercialUse: false, notices: [], outputConditions: 'Requires review of exact WaveSpeed-hosted Tripo H3.1 multiview revision and output rights',
     retention: 'Download outputs immediately after generation', trainingUse: 'Unreviewed', contentRestrictions: [], cost: { unit: 'asset', usd: 0 }, enabled: false,
   },
   {
-    provider: 'meshy', modelId: 'multi-image-to-3d', revision: 'operator-selects',
-    termsUrl: 'https://www.meshy.ai/terms', termsFingerprint: 'UNREVIEWED', reviewedAt: '2026-01-01T00:00:00.000Z', acceptedAt: null,
-    permittedTerritories: ['NONE'], commercialUse: false, notices: [], outputConditions: 'Requires operator review of exact Meshy model revision, retexture terms, and output rights',
-    retention: 'Download outputs immediately after generation', trainingUse: 'Unreviewed', contentRestrictions: [], cost: { unit: 'asset', usd: 0 }, enabled: false,
-  },
-  {
-    provider: 'sam2-local', modelId: 'sam2.1-hiera-small', revision: 'operator-selects',
+    provider: 'sam2-local', modelId: 'sam2.1-hiera-large', revision: 'operator-selects',
     termsUrl: 'https://github.com/facebookresearch/sam2/blob/main/LICENSE', termsFingerprint: 'UNREVIEWED', reviewedAt: '2026-01-01T00:00:00.000Z', acceptedAt: null,
     permittedTerritories: ['NONE'], commercialUse: false, notices: [], outputConditions: 'Install exact reviewed checkpoint separately and record its SHA-256',
     retention: 'Local processing only', trainingUse: 'No training by WorldEngine', contentRestrictions: [], cost: { unit: 'asset', usd: 0 }, enabled: false,

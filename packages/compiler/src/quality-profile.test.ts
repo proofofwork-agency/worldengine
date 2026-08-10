@@ -22,13 +22,17 @@ describe('quality profiles and certification', () => {
 
   it('requires every explicit Studio role plus bounded repair and co-deformation', () => {
     const roles: Array<[string, ProviderRole]> = [
-      ['openrouter', 'planner'], ['openrouter', 'reviewer'], ['openrouter', 'object-detection'], ['openai', 'composition-image'],
-      ['openai', 'multiview-image'], ['sam2-local', 'segmentation'], ['tripo', 'image-to-3d'],
+      ['openrouter', 'planner'], ['openrouter', 'reviewer'], ['openrouter', 'object-detection'], ['openrouter-image', 'composition-image'],
+      ['openrouter-image', 'multiview-image'], ['sam2-local', 'segmentation'], ['wavespeed', 'image-to-3d'],
     ];
-    const request = CompileRequestSchema.parse({ prompt: 'studio world', seed: 2, qualityProfile: 'studio', heroRegionIds: ['region-1'], maxCostUsd: 100, maxAssetGenerations: 6, maxReferenceImages: 1, territory: 'NL', commercialUse: true, providerModels: roles.map(([provider, role]) => model(provider, role)), refinementPolicy: { maxAssetRepairRounds: 2, maxSceneRepairRounds: 1, terrainCoDeformation: true } });
+    const request = CompileRequestSchema.parse({ prompt: 'studio world', seed: 2, qualityProfile: 'studio', heroRegionIds: ['region-1'], maxCostUsd: 100, maxAssetGenerations: 6, maxReferenceImages: 1, territory: 'NL', commercialUse: true, providerModels: roles.map(([provider, role]) => role === 'image-to-3d' ? { ...model(provider, role), modelId: 'tripo3d/h3.1/multiview-to-3d' } : role === 'composition-image' || role === 'multiview-image' ? { ...model(provider, role), modelId: 'openai/gpt-image-2' } : model(provider, role)), refinementPolicy: { maxTerrainRounds: 3, maxCompositionAttempts: 3, maxAssetAttempts: 2, maxSceneRounds: 3, maxAssetRepairRounds: 2, maxSceneRepairRounds: 1, terrainCoDeformation: true } });
     expect(() => assertQualityProfileRequest(request)).not.toThrow();
-    expect(providerForRole(request, 'image-to-3d')?.provider).toBe('tripo');
+    expect(providerForRole(request, 'image-to-3d')?.provider).toBe('wavespeed');
     expect(() => assertQualityProfileRequest({ ...request, refinementPolicy: { ...request.refinementPolicy, terrainCoDeformation: false } })).toThrow('co-deformation');
+    const directImage = { ...request, providerModels: request.providerModels.map((selection) => selection.role === 'composition-image' ? { ...selection, provider: 'openai' } : selection) };
+    expect(() => assertQualityProfileRequest(directImage)).toThrow('fail-closed OpenRouter');
+    const wrongMesh = { ...request, providerModels: request.providerModels.map((selection) => selection.role === 'image-to-3d' ? { ...selection, modelId: 'tripo3d/v2.5/image-to-3d' } : selection) };
+    expect(() => assertQualityProfileRequest(wrongMesh)).toThrow('Tripo H3.1 multiview');
   });
 
   it('certifies only complete 90-point evidence and preserves attempts in HTML', () => {

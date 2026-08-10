@@ -19,6 +19,7 @@ import { fbm2 } from './noise.js';
 import { createRandom, hash32 } from './random.js';
 import { sha256Hex } from './sha256.js';
 import { sampleTerrainHeight } from './terrain.js';
+import { sampleTerrainPlanHeight } from './plan.js';
 
 const createdAt = '2026-01-01T00:00:00.000Z';
 const prototypeKinds = [
@@ -28,8 +29,9 @@ const prototypeKinds = [
 ] as const;
 
 export const REFERENCE_SEED = 0x51f15eed;
+export const REFERENCE_SCATTER_INSTANCES_PER_CHUNK = 32;
 export const REFERENCE_BOUNDS = { min: [-2048, -2048] as [number, number], max: [2048, 2048] as [number, number] };
-export const REFERENCE_TERRAIN: TerrainSource = {
+export const REFERENCE_TERRAIN: Extract<TerrainSource, { kind: 'procedural' }> = {
   kind: 'procedural',
   seed: REFERENCE_SEED,
   amplitude: 72,
@@ -40,7 +42,7 @@ export const REFERENCE_TERRAIN: TerrainSource = {
 export function createReferenceDesignSpec(seed = REFERENCE_SEED): WorldDesignSpec {
   return WorldDesignSpecSchema.parse({
     format: 'WorldDesignSpec',
-    version: '1.1.0',
+    version: '1.2.0',
     id: `reference-design-${seed}`,
     seed,
     prompt: 'A temperate coastal valley with highlands, forest, wetlands, ruins, and a settled river plain.',
@@ -50,8 +52,11 @@ export function createReferenceDesignSpec(seed = REFERENCE_SEED): WorldDesignSpe
     bounds: REFERENCE_BOUNDS,
     chunkSize: 256,
     terrainSamples: 257,
-    style: { description: 'Style-neutral natural PBR materials with readable silhouettes', rendering: 'pbr', palette: ['#9bb174', '#496b4b', '#7d8d92', '#c5a870'] },
-    environment: { timeOfDay: 16.5, latitude: 52, weather: 'clear', waterLevel: -8, fogDensity: 0.00042, wind: [1.5, 0, 0.4] },
+    // Palette order deliberately follows the region order below. This keeps the
+    // Local draft readable as five distinct biomes instead of tinting the forest
+    // grey and the highlands grass green through a four-colour wraparound.
+    style: { description: 'Painterly-natural PBR materials with distinct coastal, wetland, forest, meadow, and rock silhouettes', rendering: 'pbr', palette: ['#78949a', '#557b59', '#355c3e', '#87984f', '#77786f'] },
+    environment: { timeOfDay: 16.5, latitude: 52, weather: 'clear', waterLevel: -8, fogDensity: 0.0003, wind: [1.5, 0, 0.4] },
     regions: [
       { id: RegionIdSchema.parse('coast'), name: 'Western Coast', polygon: [[-2048,-2048],[-900,-2048],[-700,2048],[-2048,2048]], biome: 'coastal', elevation: { min: -15, max: 28 }, density: 0.32, adjacentTo: [RegionIdSchema.parse('wetlands'), RegionIdSchema.parse('forest')] },
       { id: RegionIdSchema.parse('wetlands'), name: 'River Wetlands', polygon: [[-900,-1200],[500,-900],[650,700],[-700,900]], biome: 'wetland', elevation: { min: -8, max: 18 }, density: 0.7, adjacentTo: [RegionIdSchema.parse('coast'), RegionIdSchema.parse('settled'), RegionIdSchema.parse('forest')] },
@@ -61,13 +66,13 @@ export function createReferenceDesignSpec(seed = REFERENCE_SEED): WorldDesignSpe
     ],
     features: [
       { id: 'river-aster', kind: 'river', points: [[-620, 2048], [-420, 1120], [-180, 420], [120, -180], [420, -920], [720, -2048]], width: 44, depth: 7, tags: ['navigable-visual'] },
-      { id: 'road-old-bridge', kind: 'road', points: [[-420, -1240], [80, -720], [580, -180], [1120, 180], [1680, 420]], width: 18, depth: 0, tags: ['settlement-route'] },
+      { id: 'road-old-bridge', kind: 'road', points: [[-420, -1240], [-120, -720], [120, -180], [620, 180], [1180, 420], [1680, 520]], width: 18, depth: 0, tags: ['settlement-route'] },
       { id: 'western-shore', kind: 'coastline', points: [[-760, -2048], [-820, -1024], [-720, 0], [-760, 1024], [-680, 2048]], width: 36, depth: 2, tags: ['ocean'] },
     ],
     landmarks: [
       { id: 'sunken-ruin', name: 'Sunken Ruin', position: [-180, 4, 240], description: 'Stone remnants at the wetland edge.' },
       { id: 'east-watch', name: 'East Watch', position: [1470, 84, 940], description: 'A watchtower overlooking the vale.' },
-      { id: 'old-bridge', name: 'Old Bridge', position: [580, 8, -180], description: 'The main crossing into the settled plain.' },
+      { id: 'old-bridge', name: 'Old Bridge', position: [120, 8, -180], description: 'The main crossing into the settled plain.' },
     ],
     assetRequirements: prototypeKinds.map((kind) => ({ class: kind, count: 1, sourcePreference: ['library', 'cache', 'generate'], tags: [] })),
     constraints: ['Keep every placed object in terrain contact', 'Preserve clear regional silhouettes'],
@@ -79,7 +84,7 @@ export function createReferenceBundle(seed = REFERENCE_SEED): VisualWorldBundle 
   const prototypes = prototypeKinds.map((kind, index) => ({
     id: PrototypeIdSchema.parse(`prototype-${String(index + 1).padStart(2, '0')}-${kind}`),
     assetUri: `primitive://${kind}`,
-    contentHash: sha256Hex(`primitive:${kind}:v1`),
+    contentHash: sha256Hex(`primitive:${kind}:v3`),
     textureFormat: 'none' as const,
     lods: [],
     materialVariants: ['default', 'seasonal'],
@@ -107,7 +112,7 @@ export function createReferenceBundle(seed = REFERENCE_SEED): VisualWorldBundle 
   }
   const design = createReferenceDesignSpec(seed);
   const base = VisualWorldBundleSchema.parse({
-    format: 'VisualWorldBundle', version: '1.1.0', id: `aster-vale-v1-${seed}`, worldId: 'aster-vale', bundleVersion: 1,
+    format: 'VisualWorldBundle', version: '1.2.0', id: `aster-vale-v1-${seed}`, worldId: 'aster-vale', bundleVersion: 1,
     immutable: true, createdAt, seed, coordinateSystem: 'right-handed-y-up', units: 'meters', bounds: REFERENCE_BOUNDS,
     chunkSize: 256, terrainSamples: 257,
     terrain: { ...REFERENCE_TERRAIN, seed },
@@ -134,17 +139,53 @@ export function createReferenceBundle(seed = REFERENCE_SEED): VisualWorldBundle 
     return {
       id: EntityIdSchema.parse(`entity-${chunkX}-${chunkZ}-0`),
       prototypeId: prototype.id,
-      matrix: composeMatrix(landmark.position[0], y, landmark.position[2], (hash32(seed, index, 0x51f15eed) / 0xffffffff) * Math.PI * 2, 1.08),
-      visualState: { authored: true, landmark: true, landmarkId: landmark.id, label: landmark.name },
+      matrix: composeMatrix(
+        landmark.position[0], y, landmark.position[2],
+        landmark.id === 'old-bridge' ? -0.46 : (hash32(seed, index, 0x51f15eed) / 0xffffffff) * Math.PI * 2,
+        landmark.id === 'old-bridge' ? 3.8 : landmark.id === 'east-watch' ? 1.55 : 1.35,
+      ),
+      visualState: { authored: true, landmark: true, landmarkId: landmark.id, label: landmark.name, ...(landmark.id === 'old-bridge' ? { home: true } : {}) },
     };
   });
-  return VisualWorldBundleSchema.parse({ ...base, authoredInstances });
+  // A small authored composition makes Local useful as an art-direction draft:
+  // generated scatter still fills the world, while the first camera has a clear
+  // subject, foreground, middle ground, and skyline. These remain explicit
+  // primitive placeholders and are never presented as Studio assets.
+  const heroScene = [
+    ['cottage', 178, -106, 0.45, 1.6], ['cottage', 236, -72, -0.25, 1.45],
+    ['windmill', 266, -18, -0.18, 1.7], ['market-stall', 118, -92, 0.55, 1.3],
+    ['market-stall', 258, -126, -0.2, 1.25], ['dock', 72, -214, -0.46, 1.75],
+    ['lantern', 138, -142, 0, 2], ['lantern', 218, -106, 0, 2],
+    ['lantern', 250, -68, 0, 2], ['boulder', 18, -95, 0.3, 1.7],
+    ['boulder', -8, -53, -0.5, 1.25], ['standing-stone', -42, 22, 0.15, 1.25],
+    ['willow', 24, -202, 0.2, 1.55], ['willow', 42, -126, -0.3, 1.4],
+    ['oak', -16, -10, 0.3, 1.65], ['oak', 42, 40, -0.1, 1.5],
+    ['oak', 100, 60, 0.4, 1.75], ['birch', 158, 44, -0.2, 1.45],
+    ['birch', 214, 24, 0.6, 1.35], ['pine', -74, 78, -0.3, 1.6],
+    ['pine', -24, 114, 0.15, 1.8], ['pine', 48, 130, 0.4, 1.55],
+    ['reed', 62, -188, 0, 1.9], ['reed', 78, -162, 0, 1.65],
+    ['reed', 91, -224, 0, 1.8], ['wildflower', 164, -82, 0, 2.1],
+    ['wildflower', 195, -67, 0, 1.8], ['wildflower', 230, -55, 0, 2],
+    ['fern', 18, 18, 0.2, 1.6], ['fern', 82, 76, -0.2, 1.5],
+  ] as const;
+  const heroInstances = heroScene.map(([kind, x, z, yaw, scale], index) => {
+    const prototype = base.prototypes.find((candidate) => candidate.tags.includes(kind));
+    if (!prototype) throw new Error(`Missing Local hero prototype ${kind}`);
+    return {
+      id: EntityIdSchema.parse(`local-hero-${String(index + 1).padStart(2, '0')}-${kind}`),
+      prototypeId: prototype.id,
+      matrix: composeMatrix(x, sampleWorldHeight(base, x, z), z, yaw, scale),
+      visualState: { authored: true, localDraftHero: true, placeholder: true, label: `Local draft ${kind}` },
+    };
+  });
+  return VisualWorldBundleSchema.parse({ ...base, authoredInstances: [...authoredInstances, ...heroInstances] });
 }
 
 function composeMatrix(x: number, y: number, z: number, yaw: number, scale: number): RuntimeInstance['matrix'] {
   const cosine = Math.cos(yaw) * scale;
   const sine = Math.sin(yaw) * scale;
-  return [cosine, 0, -sine, 0, 0, scale, 0, 0, sine, 0, cosine, 0, x, y, z, 1];
+  const inverseSine = sine === 0 ? 0 : -sine;
+  return [cosine, 0, inverseSine, 0, 0, scale, 0, 0, sine, 0, cosine, 0, x, y, z, 1];
 }
 
 function pointInPolygon(x: number, z: number, polygon: ReadonlyArray<readonly [number, number]>): boolean {
@@ -211,8 +252,9 @@ function terrainSource(bundle: VisualWorldBundle, terrainEdits?: TerrainSource['
 
 export function sampleWorldHeight(bundle: VisualWorldBundle, x: number, z: number, terrainEdits?: TerrainSource['edits']): number {
   const source = terrainSource(bundle, terrainEdits);
-  const sourceWithoutEdits = source.edits.length === 0 ? source : { ...source, edits: [] };
-  const globalHeight = sampleTerrainHeight(sourceWithoutEdits, x, z);
+  const terrainRange = bundle.regions.reduce((range, region) => ({ min: Math.min(range.min, region.elevation.min), max: Math.max(range.max, region.elevation.max) }), { min: 0, max: 0 });
+  const proceduralSource = source.kind === 'procedural' ? { ...source, edits: [] } : { kind: 'procedural' as const, seed: source.seed, amplitude: Math.max(24, (terrainRange.max - terrainRange.min) * 0.42), frequency: 1 / 900, edits: [] };
+  const globalHeight = sampleTerrainHeight(proceduralSource, x, z);
   const blendWidth = Math.max(64, bundle.chunkSize * 0.7);
   const weightedRegions = bundle.regions.map((region, index) => {
     const distance = distanceToPolygon(x, z, region.polygon);
@@ -221,7 +263,8 @@ export function sampleWorldHeight(bundle: VisualWorldBundle, x: number, z: numbe
     return { index, weight };
   }).filter((entry) => entry.weight > 0);
   const totalWeight = weightedRegions.reduce((sum, entry) => sum + entry.weight, 0);
-  let height = totalWeight > 0
+  const compiledHeight = source.kind === 'compiled-heightfield' ? sampleTerrainPlanHeight(source.terrainPlan, bundle.regions, source.seed, x, z) : undefined;
+  let height = compiledHeight !== undefined ? compiledHeight * 0.94 + globalHeight * 0.06 : totalWeight > 0
     ? weightedRegions.reduce((sum, entry) => sum + regionalLandform(bundle, entry.index, x, z) * entry.weight, 0) / totalWeight * 0.86 + globalHeight * 0.14
     : globalHeight;
   for (const feature of bundle.features) {
@@ -235,7 +278,9 @@ export function sampleWorldHeight(bundle: VisualWorldBundle, x: number, z: numbe
     const influence = normalized * normalized * (3 - 2 * normalized);
     if (feature.kind === 'river') height -= feature.depth * influence;
     if (feature.kind === 'road') {
-      const centerHeight = sampleTerrainHeight(source, nearest.x, nearest.z);
+      const centerHeight = source.kind === 'compiled-heightfield'
+        ? sampleTerrainPlanHeight(source.terrainPlan, bundle.regions, source.seed, nearest.x, nearest.z) ?? sampleTerrainHeight(proceduralSource, nearest.x, nearest.z)
+        : sampleTerrainHeight(proceduralSource, nearest.x, nearest.z);
       height += (centerHeight - height) * influence * 0.82;
     }
     if (feature.kind === 'coastline') {
@@ -251,6 +296,17 @@ export function sampleWorldHeight(bundle: VisualWorldBundle, x: number, z: numbe
       else if (edit.mode === 'smooth') height += (edit.targetHeight! - height) * falloff * 0.5;
       else height += edit.delta * falloff;
     }
+  }
+  if (source.kind === 'compiled-heightfield') for (const edit of source.footprintEdits) {
+    const inside = pointInPolygon(x, z, edit.footprint);
+    const distance = inside ? 0 : distanceToPolygon(x, z, edit.footprint);
+    if (distance >= edit.falloffEndMeters) continue;
+    const falloff = distance <= edit.supportMarginMeters ? 1 : 0.5 + 0.5 * Math.cos(Math.PI * (distance - edit.supportMarginMeters) / (edit.falloffEndMeters - edit.supportMarginMeters));
+    let target = edit.targetHeight;
+    if (edit.mode === 'raise') target = Math.max(height, target);
+    if (edit.mode === 'lower') target = Math.min(height, target);
+    if (edit.mode === 'smooth') target = height + (target - height) * 0.5;
+    height += (target - height) * falloff;
   }
   return height;
 }
@@ -372,11 +428,22 @@ function buildReferenceChunk(bundle: VisualWorldBundle, coordinate: ChunkCoordin
   const centerZ = (coordinate.z + 0.5) * bundle.chunkSize;
   const region = bundle.regions.find((candidate) => pointInPolygon(centerX, centerZ, candidate.polygon));
   const densityMultiplier = region ? Math.max(0, options.regionDensities?.[region.id] ?? region.density) / Math.max(0.01, region.density) : 1;
-  const instanceCount = options.instances ?? Math.round(20 * densityMultiplier);
+  const instanceCount = options.instances ?? Math.round(REFERENCE_SCATTER_INSTANCES_PER_CHUNK * densityMultiplier);
   const random = createRandom(hash32(bundle.seed, coordinate.x, coordinate.z));
+  const authoredClearings = bundle.authoredInstances.flatMap((instance) => {
+    const prototype = bundle.prototypes.find((candidate) => candidate.id === instance.prototypeId);
+    const kind = prototype?.tags.join(' ') ?? '';
+    if (!instance.visualState['landmark'] && !/cottage|windmill|market-stall|dock|bridge/.test(kind)) return [];
+    const scale = Math.hypot(instance.matrix[0], instance.matrix[2]);
+    return [{ x: instance.matrix[12], z: instance.matrix[14], radius: Math.max(12, (prototype?.boundsRadius ?? 3) * scale + 20) }];
+  });
   const instances: RuntimeInstance[] = Array.from({ length: instanceCount }, (_, index) => {
-    const x = coordinate.x * bundle.chunkSize + random() * bundle.chunkSize;
-    const z = coordinate.z * bundle.chunkSize + random() * bundle.chunkSize;
+    let x = coordinate.x * bundle.chunkSize + random() * bundle.chunkSize;
+    let z = coordinate.z * bundle.chunkSize + random() * bundle.chunkSize;
+    for (let attempt = 0; attempt < 12 && authoredClearings.some((clearing) => Math.hypot(x - clearing.x, z - clearing.z) < clearing.radius); attempt += 1) {
+      x = coordinate.x * bundle.chunkSize + random() * bundle.chunkSize;
+      z = coordinate.z * bundle.chunkSize + random() * bundle.chunkSize;
+    }
     const y = sampleWorldHeight(bundle, x, z, options.terrainEdits);
     const pointRegion = bundle.regions.find((candidate) => pointInPolygon(x, z, candidate.polygon));
     const candidates = prototypeCandidates(bundle, pointRegion?.biome);
@@ -417,10 +484,17 @@ function buildReferenceChunk(bundle: VisualWorldBundle, coordinate: ChunkCoordin
       instanceIds: instances.filter((instance) => instance.matrix[12] >= minX && instance.matrix[12] < maxX && instance.matrix[14] >= minZ && instance.matrix[14] < maxZ).map((instance) => instance.id),
     };
   });
+  const materialSplats = bundle.terrain?.kind === 'compiled-heightfield' && biomeWeights ? bundle.terrain.materialSets.map((material) => {
+    const regionIndexes = new Set(bundle.regions.map((candidate, index) => candidate.biome === material.biome ? index : -1).filter((index) => index >= 0));
+    const weights = Uint8Array.from(biomeWeights, (regionIndex) => regionIndexes.has(regionIndex) ? 255 : 0);
+    return { materialSetId: material.id, encoding: 'uint8-base64' as const, weights: encodeUint8(weights) };
+  }) : [];
+  const textureDependencies = bundle.terrain?.kind === 'compiled-heightfield'
+    ? bundle.terrain.materialSets.flatMap((material) => [material.baseColorUri, material.normalUri, material.roughnessUri, material.macroVariationUri]) : [];
   return RuntimeChunkDocumentSchema.parse({
-    format: 'RuntimeChunk', version: '1.1.0', id, coordinate,
+    format: 'RuntimeChunk', version: '1.2.0', id, coordinate,
     bounds: { min: [coordinate.x * bundle.chunkSize, coordinate.z * bundle.chunkSize], max: [(coordinate.x + 1) * bundle.chunkSize, (coordinate.z + 1) * bundle.chunkSize] },
-    terrain: { samples, encoding: 'float32-base64', heights: encodeFloat32(heights), minHeight, maxHeight, ...(biomeWeights ? { biomeWeights: encodeUint8(biomeWeights) } : {}) },
+    terrain: { samples, encoding: 'float32-base64', heights: encodeFloat32(heights), minHeight, maxHeight, ...(biomeWeights ? { biomeWeights: encodeUint8(biomeWeights) } : {}), materialSplats, textureDependencies },
     instances,
     dependencies: [...new Set(instances.map((instance) => instance.prototypeId))].sort(),
     occlusionCells,

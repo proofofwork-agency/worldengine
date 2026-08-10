@@ -3,7 +3,7 @@ import { KHRONOS_EXTENSIONS } from '@gltf-transform/extensions';
 import sharp from 'sharp';
 import { describe, expect, it } from 'vitest';
 import { validateGlb, validateKtx2 } from './asset-validation.js';
-import { transcodeGlbTexturesToKtx2 } from './texture-optimizer.js';
+import { transcodeGlbTexturesToKtx2, transcodeTextureToKtx2 } from './texture-optimizer.js';
 
 async function texturedTriangleGlb(): Promise<Uint8Array> {
   const document = new Document();
@@ -27,6 +27,12 @@ async function texturedTriangleGlb(): Promise<Uint8Array> {
 }
 
 describe('KTX2 texture optimization', () => {
+  it('transcodes a standalone terrain channel to validated KTX2', async () => {
+    const source = await sharp({ create: { width: 16, height: 16, channels: 4, background: { r: 90, g: 120, b: 70, alpha: 1 } } }).png().toBuffer();
+    const encoded = await transcodeTextureToKtx2(Uint8Array.from(source), { maxDimension: 64, perceptual: true, uastcQuality: 1 });
+    expect(validateKtx2(encoded)).toEqual([]);
+  });
+
   it('transcodes embedded PBR images to validated mipmapped Basis KTX2', async () => {
     const source = await texturedTriangleGlb();
     const optimized = await transcodeGlbTexturesToKtx2(source, { maxDimension: 64, uastcQuality: 1 });

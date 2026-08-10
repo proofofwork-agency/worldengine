@@ -20,8 +20,40 @@ export interface TextureOptimizationResult {
   optimizedTextureBytes: number;
 }
 
+export interface StandaloneTextureOptimizationOptions extends TextureOptimizationOptions {
+  normalMap?: boolean;
+  perceptual?: boolean;
+}
+
 const supportedMimeTypes = new Set(['image/png', 'image/jpeg', 'image/webp']);
 const colorSlots = new Set(['baseColorTexture', 'emissiveTexture', 'sheenColorTexture', 'specularColorTexture']);
+
+export async function transcodeTextureToKtx2(input: Uint8Array, options: StandaloneTextureOptimizationOptions = {}): Promise<Uint8Array> {
+  const maxDimension = Math.max(64, Math.min(8_192, Math.floor(options.maxDimension ?? 2_048)));
+  const encoded = await encodeToKTX2(input, {
+    isUASTC: true,
+    needSupercompression: true,
+    generateMipmap: true,
+    enableRDO: true,
+    rdoQualityLevel: Math.max(0.01, Math.min(10, options.rdoQuality ?? 1)),
+    uastcLDRQualityLevel: options.uastcQuality ?? 2,
+    isNormalMap: options.normalMap ?? false,
+    isPerceptual: options.perceptual ?? false,
+    isSetKTX2SRGBTransferFunc: options.perceptual ?? false,
+    imageDecoder: async (buffer) => {
+      const decoded = await sharp(buffer, { limitInputPixels: 268_402_689 })
+        .resize({ width: maxDimension, height: maxDimension, fit: 'inside', withoutEnlargement: true })
+        .toColourspace('srgb')
+        .ensureAlpha()
+        .raw()
+        .toBuffer({ resolveWithObject: true });
+      return { data: Uint8Array.from(decoded.data), width: decoded.info.width, height: decoded.info.height };
+    },
+  });
+  const issues = validateKtx2(encoded);
+  if (issues.length > 0) throw new Error(`Basis encoder returned invalid KTX2: ${issues.map((issue) => issue.message).join('; ')}`);
+  return encoded;
+}
 
 /**
  * Converts embedded glTF textures to mipmapped Basis Universal UASTC KTX2.
@@ -70,6 +102,7 @@ export async function transcodeGlbTexturesToKtx2(input: Uint8Array, options: Tex
           // Preserve encoded pixel orientation: glTF UVs, not EXIF metadata,
           // are authoritative for how a material samples its texture.
           .resize({ width: maxDimension, height: maxDimension, fit: 'inside', withoutEnlargement: true })
+          .toColourspace('srgb')
           .ensureAlpha()
           .raw()
           .toBuffer({ resolveWithObject: true });

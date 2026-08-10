@@ -1,13 +1,13 @@
 import { z } from 'zod';
 
-export const WORLD_FORMAT_VERSION = '1.1.0' as const;
-export const LEGACY_WORLD_FORMAT_VERSIONS = ['1.0.0'] as const;
+export const WORLD_FORMAT_VERSION = '1.2.0' as const;
+export const LEGACY_WORLD_FORMAT_VERSIONS = ['1.0.0', '1.1.0'] as const;
 
 export function migrateWorldFormatDocument(input: unknown): unknown {
   if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
   const document = input as Record<string, unknown>;
   const knownFormat = ['WorldDesignSpec', 'AuthoringWorld', 'VisualWorldBundle', 'RuntimeChunk'].includes(String(document['format']));
-  if (!knownFormat || !LEGACY_WORLD_FORMAT_VERSIONS.includes(document['version'] as '1.0.0')) return input;
+  if (!knownFormat || !LEGACY_WORLD_FORMAT_VERSIONS.includes(document['version'] as (typeof LEGACY_WORLD_FORMAT_VERSIONS)[number])) return input;
   return { ...document, version: WORLD_FORMAT_VERSION };
 }
 

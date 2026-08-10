@@ -46,7 +46,7 @@ cp apps/compiler-service/.env.example apps/compiler-service/.env.local
 corepack pnpm --filter @worldengine/compiler-service dev:configured
 ```
 
-In `.worldengine/provider-policy.json`, replace every placeholder with the exact current model revision, terms fingerprint, real unit cost, permitted territory, and commercial-use decision; add `acceptedAt` and set `enabled` only after that review. Put only the keys for your selected profiles in the ignored `.env.local`. Studio additionally needs a separately installed Blender 5.1 executable and reviewed local SAM2 checkpoint. Startup fails closed if an enabled profile lacks its credential or capability. Validate the setup without calling a provider:
+In `.worldengine/provider-policy.json`, replace every placeholder with the exact current model revision, terms fingerprint, real unit cost, permitted territory, and commercial-use decision; add `acceptedAt` and set `enabled` only after that review. Put `OPENROUTER_API_KEY` and `WAVESPEED_API_KEY` in ignored `.env.local` (preferred) or `.env`; the configured scripts load both and `.env.local` wins. The OpenRouter key serves the separate `openrouter` planning/review and `openrouter-image` GPT Image profiles. Studio additionally needs a separately installed Blender 5.1 executable and reviewed local SAM2 checkpoint. Startup fails closed if an enabled profile lacks its credential or capability. Validate the setup without calling a provider:
 
 ```bash
 corepack pnpm provider:check -- --profile studio
@@ -58,15 +58,15 @@ Localhost, loopback, private-LAN, and `.local` editor origins may mutate the com
 
 The editor exposes three explicit profiles:
 
-- **Local** (`$0`) builds deterministic 257×257 region-aware terrain, PBR procedural placeholders, 5,000+ instances, streaming, weather, water, LOD and editing. It is the reliable baseline, not a paper-quality hero-asset claim.
+- **Local draft** (`$0`) builds deterministic 257×257 region-aware terrain, procedural placeholders, 5,000+ instances, streaming, weather, water, LOD and editing. It is an explicit draft, never a paper-quality result or a cloud-failure fallback.
 - **Cheap** (`≤ $15`) adds server-side BYOK planning/review, terrain-conditioned regional imagery, isolated transparent references and single-image Tripo reconstruction through WaveSpeed for one hero region. Reviewed library/cache GLBs are reused first.
-- **Studio** (`≤ $100`) adds actual composition detection, local box-prompted SAM2 masks, five identity-preserving references (four ordered cardinal views feed reconstruction), direct Tripo or Meshy PBR reconstruction, a separate Blender 5.1 worker, RGB/depth/normal/instance evidence, deterministic reverse-projection placement, local terrain support fitting and multimodal publication review across up to five hero regions.
+- **Studio · experimental** first runs one hero region under an explicitly confirmed `$25` cap. It adds executable composite terrain plans, actual composition detection, local SAM2.1 Hiera Large masks, alpha crops, four ordered identity-preserving views, WaveSpeed-hosted Tripo H3.1 PBR reconstruction, a separate Blender 5.1 worker, RGB/depth/normal/semantic/instance evidence, calibrated placement, mesh-footprint terrain fitting and bounded multimodal repair. Only after that gate passes may an operator separately authorize scaling to five regions under `$100`.
 
-Generated records receive `reviewedAt` only after the reviewer sees persisted terrain/composition pairs, masks, isolated and multiview references, exact-GLB diagnostics, Blender passes and placement evidence. Raw provider output, Blender-refined output, optimized GLBs and failed diagnostics remain content-addressed in provenance. A rejected review publishes no bundle. There is no silent model fallback, blind billable POST retry, browser key storage or camera-triggered generation.
+Generated records receive `reviewedAt` only after the reviewer sees persisted terrain/composition pairs, masks, crops and multiview references, exact-GLB diagnostics, Blender passes and placement evidence. Raw provider output, Blender-refined output, optimized GLBs and rejected diagnostics remain content-addressed in the compile artifact catalog. A rejected run publishes no bundle and leaves the open world labelled `Local draft`; it appears separately as `needs attention`. Every unique provider action reserves the reviewed unit price before invocation and is recorded with its exact provider/model/revision; resume runs carry prior spend forward. There is no silent model fallback, blind billable POST retry, browser key storage or camera-triggered generation.
 
 The Blender code is an optional separately installed GPL-3.0-or-later worker. The Apache TypeScript core sends only a fixed JSON job with allowlisted operations; it never evaluates model-generated Python. Blender repairs the isolated asset and produces diagnostic passes. Renderer-neutral height-field edits perform bounded local flatten/smooth support fitting after placement, preserving the global terrain. BlenderMCP is therefore not required and is not silently installed.
 
-Quality similarity is not self-declared. `benchmarks/visual-world-parity-v1.json` defines five paper-derived scenarios, seven weighted dimensions, a 90/100 threshold, minimum per-dimension and per-scenario scores, all hard gates, and independent blinded raters. The service accepts scenario-specific immutable evidence and will publish a certification only when its hashes, provider fingerprints, Studio artifacts, cost, rater agreement and arithmetic all pass. Until that manual benchmark is run, the honest status is **implemented Studio pipeline, not yet 90/100 certified**. See [docs/PAPER_PARITY.md](docs/PAPER_PARITY.md).
+Quality similarity is not self-declared. `benchmarks/visual-world-parity-v1.json` defines five paper-derived scenarios, seven weighted dimensions, a 90/100 threshold, minimum per-dimension and per-scenario scores, all hard gates, and independent blinded raters. The service accepts scenario-specific immutable evidence and will publish a certification only when its hashes, provider fingerprints, Studio artifacts, cost, rater agreement and arithmetic all pass. Until a real paid run and external assessment exist, the honest product status is **experimental Studio pipeline; no 90/100 or parity claim**. See [docs/PAPER_PARITY.md](docs/PAPER_PARITY.md).
 
 ## Generation routes
 
@@ -76,8 +76,8 @@ WorldEngine never silently switches between these routes. The request, reviewed 
 | --- | --- | --- | --- |
 | **Local** | None | Free deterministic baseline and offline development | Prompt/spec → vector regions → seeded terrain/features/scatter → project-authored PBR visual prototypes → immutable bundle |
 | **Reviewed import** | None inside WorldEngine | Highest-control hero assets made or licensed elsewhere | Rights affirmation → GLB validation → content hash → optimization/LODs → provenance → immutable version |
-| **Cheap BYOK** | OpenRouter + OpenAI + WaveSpeed | One enriched hero region under a `$15` hard maximum | Structured plan/review → terrain-conditioned image edit → isolated reference → single-image Tripo → placement/review |
-| **Studio BYOK** | OpenRouter + OpenAI + direct Tripo **or** Meshy | Up to five hero regions under a `$100` hard maximum | Detection → local SAM2 mask → identity views → four-cardinal PBR reconstruction → fixed Blender repair/passes → reverse projection → terrain support fitting → bounded multimodal review |
+| **Cheap BYOK** | OpenRouter planning + OpenRouter Images + WaveSpeed | One enriched hero region under a `$15` hard maximum | Structured plan/review → terrain-conditioned image edit → isolated reference → single-image Tripo → placement/review |
+| **Studio BYOK · experimental** | OpenRouter planning/images + local SAM2.1 Large + WaveSpeed Tripo H3.1 + local Blender 5.1 | First one hero region under `$25`; separate later scale gate up to five/$100 | Compiled terrain → registered Blender passes → terrain-conditioned edit → detection/mask/crop → four-cardinal PBR reconstruction → fixed Blender validation → calibrated silhouette/contact fit → bounded typed repair |
 | **Sparse expansion** | None | Explicitly materialize an out-of-bounds visual chunk | Deterministic placeholder → explicit `$0` chunk request → detailed immutable chunk hot-patch |
 
 Camera movement never selects a route or starts billable work. Generated assets are published only after schema-valid review; imported assets require explicit rights metadata. BlenderMCP, Claude, Hunyuan3D, SAM3, and generated Python are not runtime dependencies.
@@ -88,13 +88,11 @@ All provider calls originate in `@worldengine/compiler-service`; the editor and 
 
 | Service | Default outbound endpoints | WorldEngine role |
 | --- | --- | --- |
-| **OpenRouter** | `GET /api/v1/model/{author}/{model}`; `POST /api/v1/chat/completions` | Capability check, structured planning, composition detection, and multimodal review with fallback disabled and ZDR/data-collection controls requested |
-| **OpenAI Images** | `POST /v1/images/edits`; `POST /v1/images/generations` | Terrain-conditioned regional composition, transparent object isolation, and identity-preserving view generation |
-| **WaveSpeed** | `POST /api/v3/{reviewed-model-id}`; submission-provided same-origin result URL | Cheap-route single-image Tripo job; outputs are downloaded and validated immediately |
-| **Tripo Platform** | `POST /v2/openapi/upload/sts`; `POST /v2/openapi/task`; `GET /v2/openapi/task/{taskId}` | Studio four-cardinal-view PBR reconstruction using the exact reviewed Tripo revision |
-| **Meshy** | `POST /openapi/v1/multi-image-to-3d`; `GET /openapi/v1/multi-image-to-3d/{taskId}` | Deliberate Studio alternative to Tripo; never an automatic fallback |
-| **SAM2 worker** | No cloud endpoint | Local box-prompted segmentation through a fixed JSON process contract and separately reviewed checkpoint |
-| **Blender worker** | No cloud endpoint | Optional local GPL worker for allowlisted mesh repair plus RGB/depth/normal/instance diagnostic renders |
+| **OpenRouter planning** | `GET /api/v1/model/{author}/{model}`; `POST /api/v1/chat/completions` | Capability check, structured planning, composition detection, and multimodal review with fallback disabled and ZDR/data-collection controls requested |
+| **OpenRouter Images** | `GET /api/v1/images/models`; `POST /api/v1/images` | Default BYOK image route for `openai/gpt-image-2`: terrain-conditioned reference edits, transparent isolation, and identity views, with provider fallback disabled |
+| **WaveSpeed** | `POST /api/v3/{reviewed-model-id}`; submission-provided same-origin result URL | Cheap single-image job and Studio `tripo3d/h3.1/multiview-to-3d`; four ordered inputs, detailed triangle geometry/textures, PBR, `align_image`, `auto_size: false` |
+| **SAM2 worker** | No cloud endpoint | Local SAM2.1 Hiera Large box-prompted segmentation through a fixed JSON process contract and pinned code/checkpoint hashes |
+| **Blender worker** | No cloud endpoint | Local GPL worker for allowlisted mesh/region repair plus RGB/depth/normal/semantic/instance renders |
 
 WaveSpeed may call the inbound `POST /v1/webhooks/wavespeed` compiler route when configured; the service requires a fresh HMAC signature and durably deduplicates event IDs. Provider POSTs use idempotency protection and are not blindly retried. Endpoint availability, pricing, retention, commercial rights, and model terms can change, so the committed provider policy is intentionally disabled and unusable until an operator reviews the current terms.
 
@@ -177,7 +175,7 @@ Run the complete non-browser release gate (all builds and TypeScript checks, Vit
 
 ## Release boundary
 
-The self-hosted local visual-world path and the guarded Studio orchestration path are implemented and tested: canonical schemas, the 4×4 km fixture, deterministic/sparse chunks, runtime/editor integration, immutable storage, compiler recovery, provider policies, SAM2/Blender worker contracts, direct Tripo/Meshy adapters, reviewed GLB LOD/KTX2 provenance, and strict benchmark certification. Production WebGPU/WebGL2 baselines pass the live UI budget in the tested viewport. Paid live-provider quality, independent 90/100 ratings, an independent risk review, and named 1080p/Apple-M2 certification remain manual gates.
+The self-hosted Local draft path is implemented and tested. Studio remains experimental: the repository contains the 1.2 contracts, compiled terrain operators, fixed WaveSpeed/SAM2/Blender orchestration, artifact and resume APIs, deterministic gates and mocked integration coverage, but no paid Studio output has been accepted. Paid live-provider quality, the `$25` M3 Pro/1080p hero gate, external 90/100 ratings, and independent risk review remain mandatory before any parity or production-quality claim.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md) for the exact implemented surface and guarded follow-on work.
 

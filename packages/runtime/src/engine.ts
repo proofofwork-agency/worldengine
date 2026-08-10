@@ -252,6 +252,8 @@ export class DefaultVisualWorldEngine implements VisualWorldEngine {
         minHeight: document.terrain.minHeight,
         maxHeight: document.terrain.maxHeight,
         ...(document.terrain.biomeWeights ? { biomeWeights: decodeUint8(document.terrain.biomeWeights, document.terrain.samples ** 2) } : {}),
+        materialSplats: document.terrain.materialSplats.map((splat) => ({ materialSetId: splat.materialSetId, weights: decodeUint8(splat.weights, document.terrain.samples ** 2) })),
+        textureDependencies: document.terrain.textureDependencies,
       },
     };
     await this.backend.loadChunk(chunk);

@@ -29,6 +29,26 @@ export interface JsonPlanningInput {
   jsonSchema: Record<string, unknown>;
 }
 
+function normalizeOpenAiStructuredOutputSchema(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizeOpenAiStructuredOutputSchema);
+  if (!value || typeof value !== 'object') return value;
+  const source = value as Record<string, unknown>;
+  const schemaNode = 'type' in source || 'anyOf' in source || '$ref' in source || '$schema' in source;
+  const normalized = Object.fromEntries(Object.entries(source)
+    .filter(([key]) => !(schemaNode && (key === '$schema' || key === 'default' || key === 'format')))
+    .map(([key, child]) => [key, normalizeOpenAiStructuredOutputSchema(child)]));
+  if (Array.isArray(normalized['items'])) {
+    const tupleItems = normalized['items'] as unknown[];
+    if (tupleItems.length === 0) throw new Error('Structured-output tuple schemas must contain at least one item');
+    const signatures = tupleItems.map((item) => JSON.stringify(item));
+    if (!signatures.every((signature) => signature === signatures[0])) throw new Error('OpenAI structured outputs do not support heterogeneous tuple schemas');
+    normalized['items'] = tupleItems[0];
+    normalized['minItems'] = tupleItems.length;
+    normalized['maxItems'] = tupleItems.length;
+  }
+  return normalized;
+}
+
 export class OpenRouterPlanningAdapter implements ProviderAdapter<JsonPlanningInput, unknown> {
   readonly provider = 'openrouter';
   private readonly guard = new ProviderRequestGuard();
@@ -70,7 +90,7 @@ export class OpenRouterPlanningAdapter implements ProviderAdapter<JsonPlanningIn
       body: JSON.stringify({
         model: this.modelId,
         messages: request.input.messages,
-        response_format: { type: 'json_schema', json_schema: { name: request.input.schemaName, strict: true, schema: request.input.jsonSchema } },
+        response_format: { type: 'json_schema', json_schema: { name: request.input.schemaName, strict: true, schema: normalizeOpenAiStructuredOutputSchema(request.input.jsonSchema) } },
         provider: { allow_fallbacks: false, require_parameters: true, data_collection: 'deny', zdr: true },
         ...request.settings,
       }),
@@ -98,6 +118,92 @@ const ImageGenerationInputSchema = z.object({
 });
 export type ImageGenerationInput = z.infer<typeof ImageGenerationInputSchema>;
 export interface GeneratedImageOutput { images: Array<{ base64?: string; url?: string; revisedPrompt?: string }> }
+
+/**
+ * OpenRouter's dedicated Images API is intentionally exposed as a separate
+ * provider identity. This prevents an image model from being registered behind
+ * the structured chat adapter merely because both use OPENROUTER_API_KEY.
+ */
+export class OpenRouterImageAdapter implements ProviderAdapter<ImageGenerationInput, GeneratedImageOutput> {
+  readonly provider = 'openrouter-image';
+  private readonly guard = new ProviderRequestGuard();
+
+  constructor(
+    readonly modelId: string,
+    readonly revision: string,
+    private readonly apiKey: string,
+    private readonly fetcher: typeof fetch = fetch,
+    private readonly baseUrl = 'https://openrouter.ai/api/v1',
+  ) {}
+
+  async checkCapabilities(): Promise<{ structuredOutput: boolean; imageInput: boolean }> {
+    const response = await this.fetcher(`${this.baseUrl}/images/models`, { headers: this.headers() });
+    if (!response.ok) throw new Error(`OpenRouter image capability check failed: ${response.status}`);
+    const body = await response.json() as { data?: Array<{ id?: string; architecture?: { input_modalities?: string[]; output_modalities?: string[] } }> };
+    const model = body.data?.find((candidate) => candidate.id?.toLowerCase() === this.modelId.toLowerCase());
+    if (!model) throw new Error(`OpenRouter image model ${this.modelId} is unavailable`);
+    const outputImage = model.architecture?.output_modalities?.includes('image') ?? false;
+    return { structuredOutput: false, imageInput: outputImage && (model.architecture?.input_modalities?.includes('image') ?? false) };
+  }
+
+  async estimate(): Promise<number> {
+    throw new Error('OpenRouter image cost must come from the reviewed provider profile');
+  }
+
+  async invoke(request: ProviderInvocation<ImageGenerationInput, GeneratedImageOutput>, signal?: AbortSignal): Promise<GeneratedImageOutput> {
+    return this.guard.invokeOnce(request.idempotencyKey, () => this.invokeRequest(request, signal));
+  }
+
+  private async invokeRequest(request: ProviderInvocation<ImageGenerationInput, GeneratedImageOutput>, signal?: AbortSignal): Promise<GeneratedImageOutput> {
+    rejectReservedSettings(request.settings, ['model', 'prompt', 'size', 'quality', 'background', 'n', 'input_references', 'inputImages', 'provider'], 'OpenRouter image');
+    const input = ImageGenerationInputSchema.parse(request.input);
+    // OpenRouter's current GPT Image 2 catalog accepts only `auto` or `opaque`
+    // backgrounds. Preserve the renderer-neutral API while degrading an
+    // unsupported transparent request to the provider's supported `auto` mode.
+    const background = input.background === 'transparent' ? 'auto' : input.background;
+    const inputReferences = input.inputImages.map((image) => {
+      if (image.source.startsWith('data:')) {
+        const match = image.source.match(/^data:(image\/(?:png|jpeg|webp));base64,([a-z\d+/=]+)$/i);
+        if (!match) throw new Error('OpenRouter image reference must be a base64 PNG, JPEG, or WebP data URL');
+        const bytes = Buffer.from(match[2]!, 'base64');
+        if (bytes.byteLength === 0 || bytes.byteLength > 50 * 1024 * 1024) throw new Error('OpenRouter image reference is empty or exceeds 50 MB');
+      } else {
+        assertSafeRemoteHttpsUrl(image.source, 'OpenRouter image reference URL');
+      }
+      return { type: 'image_url' as const, image_url: { url: image.source } };
+    });
+    const response = await this.fetcher(`${this.baseUrl}/images`, {
+      method: 'POST', ...(signal ? { signal } : {}),
+      headers: { ...this.headers(), 'content-type': 'application/json', 'x-idempotency-key': request.idempotencyKey },
+      body: JSON.stringify({
+        model: this.modelId,
+        prompt: input.prompt,
+        size: input.size,
+        quality: input.quality,
+        background,
+        output_format: 'png',
+        n: input.n,
+        ...(inputReferences.length > 0 ? { input_references: inputReferences } : {}),
+        provider: { allow_fallbacks: false },
+        ...request.settings,
+      }),
+    });
+    if (!response.ok) throw new Error(`OpenRouter image request failed: ${response.status} ${await response.text()}`);
+    const body = await response.json() as { data?: Array<{ b64_json?: string; url?: string; revised_prompt?: string }> };
+    const images = (body.data ?? []).map((image) => ({
+      ...(image.b64_json ? { base64: image.b64_json } : {}),
+      ...(image.url ? { url: image.url } : {}),
+      ...(image.revised_prompt ? { revisedPrompt: image.revised_prompt } : {}),
+    }));
+    if (images.length === 0) throw new Error('OpenRouter returned no generated images');
+    return { images };
+  }
+
+  private headers(): Record<string, string> {
+    if (!this.apiKey) throw new Error('OPENROUTER_API_KEY is required');
+    return { authorization: `Bearer ${this.apiKey}` };
+  }
+}
 
 export class OpenAIImageAdapter implements ProviderAdapter<ImageGenerationInput, GeneratedImageOutput> {
   readonly provider = 'openai';
@@ -266,7 +372,7 @@ function abortableDelay(milliseconds: number, signal?: AbortSignal): Promise<voi
   });
 }
 
-const MultiImageTo3DInputSchema = z.object({
+export const MultiImageTo3DInputSchema = z.object({
   images: z.array(z.object({ source: z.string().min(1), orientation: z.enum(['front', 'left', 'back', 'right', 'perspective']) })).min(2).max(5),
   pbr: z.literal(true).default(true),
   geometryQuality: z.enum(['standard', 'detailed']).default('detailed'),
@@ -286,6 +392,60 @@ function cardinalViews(input: MultiImageTo3DInput): Array<MultiImageTo3DInput['i
   });
 }
 
+/** WaveSpeed-hosted Tripo H3.1 multiview. Studio always submits only the
+ * ordered front/left/back/right cardinal set. */
+export class WaveSpeedTripoMultiviewAdapter implements ProviderAdapter<MultiImageTo3DInput, PredictionOutput> {
+  readonly provider = 'wavespeed';
+  private readonly guard = new ProviderRequestGuard();
+
+  constructor(
+    readonly modelId = 'tripo3d/h3.1/multiview-to-3d',
+    readonly revision = 'operator-selects',
+    private readonly apiKey: string,
+    private readonly fetcher: typeof fetch = fetch,
+    private readonly baseUrl = 'https://api.wavespeed.ai/api/v3',
+    private readonly pollIntervalMs = 2_000,
+  ) {}
+
+  async checkCapabilities() { return { structuredOutput: false, imageInput: true, multiImageInput: true, pbr3d: true }; }
+  async estimate(): Promise<number> { throw new Error('WaveSpeed multiview cost must come from the reviewed provider profile'); }
+  async invoke(request: ProviderInvocation<MultiImageTo3DInput, PredictionOutput>, signal?: AbortSignal): Promise<PredictionOutput> {
+    return this.guard.invokeOnce(request.idempotencyKey, () => this.invokeRequest(request, signal));
+  }
+
+  private async invokeRequest(request: ProviderInvocation<MultiImageTo3DInput, PredictionOutput>, signal?: AbortSignal): Promise<PredictionOutput> {
+    if (!this.apiKey) throw new Error('WAVESPEED_API_KEY is required');
+    const input = MultiImageTo3DInputSchema.parse(request.input);
+    const images = cardinalViews(input).map((image) => image.source);
+    rejectReservedSettings(request.settings, ['images', 'pbr', 'geometry_quality', 'texture_quality', 'texture_resolution', 'texture_alignment', 'orientation', 'auto_size', 'quad', 'face_limit', 'model_seed', 'output_format'], 'WaveSpeed Tripo multiview');
+    const response = await this.fetcher(`${this.baseUrl}/${this.modelId}`, {
+      method: 'POST', ...(signal ? { signal } : {}),
+      headers: { authorization: `Bearer ${this.apiKey}`, 'content-type': 'application/json', 'x-idempotency-key': request.idempotencyKey },
+      body: JSON.stringify({
+        images, pbr: true, geometry_quality: input.geometryQuality, texture_quality: 'detailed', texture_resolution: input.textureResolution,
+        texture_alignment: 'geometry', orientation: 'align_image', auto_size: false, quad: false, face_limit: input.faceLimit,
+        model_seed: input.seed, output_format: 'glb', ...request.settings,
+      }),
+    });
+    if (!response.ok) throw new Error(`WaveSpeed multiview submission failed: ${response.status} ${await response.text()}`);
+    const submitted = await response.json() as { code?: number; message?: string; data?: PredictionRecord };
+    if (submitted.code !== undefined && submitted.code !== 200) throw new Error(submitted.message ?? 'WaveSpeed multiview submission failed');
+    let prediction = submitted.data;
+    if (!prediction?.id) throw new Error('WaveSpeed multiview response did not contain a prediction id');
+    const resultUrl = assertSafeRemoteHttpsUrl(prediction.urls?.get ?? `${this.baseUrl}/predictions/${prediction.id}/result`, 'WaveSpeed result URL');
+    if (resultUrl.origin !== new URL(this.baseUrl).origin) throw new Error('WaveSpeed result URL must remain on the configured API origin');
+    while (!['completed', 'failed', 'cancelled', 'timeout'].includes(prediction.status)) {
+      await abortableDelay(this.pollIntervalMs, signal);
+      const result = await this.fetcher(resultUrl, { headers: { authorization: `Bearer ${this.apiKey}` }, ...(signal ? { signal } : {}) });
+      if (!result.ok) throw new Error(`WaveSpeed multiview result query failed: ${result.status}`);
+      const body = await result.json() as { data?: PredictionRecord };
+      if (body.data) prediction = body.data;
+    }
+    if (prediction.status !== 'completed') throw new Error(`WaveSpeed multiview prediction ${prediction.status}: ${prediction.error ?? 'unknown error'}`);
+    return { predictionId: prediction.id, outputs: await Promise.all((prediction.outputs ?? []).filter((output) => output.toLowerCase().endsWith('.glb')).map((output) => downloadGlb(output, this.fetcher, signal))) };
+  }
+}
+
 async function downloadGlb(source: string, fetcher: typeof fetch, signal?: AbortSignal): Promise<{ sourceUrl: string; bytes: Uint8Array; contentType: string }> {
   const url = assertSafeRemoteHttpsUrl(source, '3D provider GLB output URL');
   const response = await fetcher(url, signal ? { signal } : {});
@@ -296,130 +456,4 @@ async function downloadGlb(source: string, fetcher: typeof fetch, signal?: Abort
   if (bytes.byteLength > 512 * 1024 * 1024) throw new Error('3D provider output exceeds 512 MB');
   assertValidGlb(bytes);
   return { sourceUrl: url.href, bytes, contentType: 'model/gltf-binary' };
-}
-
-/** Direct Tripo multiview adapter. The exact model revision is supplied by the
- * reviewed operator policy; aliases such as "latest" are rejected upstream. */
-export class DirectTripoMultiviewAdapter implements ProviderAdapter<MultiImageTo3DInput, PredictionOutput> {
-  readonly provider = 'tripo';
-  private readonly guard = new ProviderRequestGuard();
-
-  constructor(
-    readonly modelId: string,
-    readonly revision: string,
-    private readonly apiKey: string,
-    private readonly fetcher: typeof fetch = fetch,
-    private readonly baseUrl = 'https://api.tripo3d.ai/v2/openapi',
-    private readonly pollIntervalMs = 2_000,
-  ) {}
-
-  async checkCapabilities() { return { structuredOutput: false, imageInput: true, multiImageInput: true, pbr3d: true }; }
-  async estimate(): Promise<number> { throw new Error('Tripo cost must come from the reviewed provider profile'); }
-  async invoke(request: ProviderInvocation<MultiImageTo3DInput, PredictionOutput>, signal?: AbortSignal): Promise<PredictionOutput> {
-    return this.guard.invokeOnce(request.idempotencyKey, () => this.invokeRequest(request, signal));
-  }
-
-  private async invokeRequest(request: ProviderInvocation<MultiImageTo3DInput, PredictionOutput>, signal?: AbortSignal): Promise<PredictionOutput> {
-    if (!this.apiKey) throw new Error('TRIPO_API_KEY is required');
-    const input = MultiImageTo3DInputSchema.parse(request.input);
-    rejectReservedSettings(request.settings, ['type', 'files', 'model_version', 'pbr', 'texture', 'texture_quality', 'texture_alignment', 'orientation', 'face_limit', 'model_seed'], 'Tripo');
-    const files = [] as Array<{ type: 'jpg' | 'png'; file_token: string }>;
-    for (const image of cardinalViews(input)) {
-      const form = new FormData();
-      let bytes: Uint8Array;
-      let mime = 'image/png';
-      if (image.source.startsWith('data:')) {
-        const match = image.source.match(/^data:(image\/(?:png|jpeg));base64,([a-z\d+/=]+)$/i);
-        if (!match) throw new Error('Tripo multiview input must be a PNG/JPEG data URL or public HTTPS URL');
-        mime = match[1]!.toLowerCase(); bytes = new Uint8Array(Buffer.from(match[2]!, 'base64'));
-      } else {
-        const source = assertSafeRemoteHttpsUrl(image.source, 'Tripo multiview input URL');
-        const downloaded = await this.fetcher(source, signal ? { signal } : {});
-        if (!downloaded.ok) throw new Error(`Unable to ingest Tripo input: ${downloaded.status}`);
-        bytes = new Uint8Array(await downloaded.arrayBuffer()); mime = downloaded.headers.get('content-type')?.split(';', 1)[0] ?? mime;
-      }
-      const uploadBytes = new Uint8Array(bytes); form.append('file', new Blob([uploadBytes.buffer], { type: mime }), mime === 'image/jpeg' ? 'view.jpg' : 'view.png');
-      const upload = await this.fetcher(`${this.baseUrl}/upload/sts`, { method: 'POST', headers: { authorization: `Bearer ${this.apiKey}` }, body: form, ...(signal ? { signal } : {}) });
-      if (!upload.ok) throw new Error(`Tripo upload failed: ${upload.status} ${await upload.text()}`);
-      const body = await upload.json() as { code?: number; message?: string; data?: { image_token?: string } };
-      if (body.code !== undefined && body.code !== 0) throw new Error(body.message ?? `Tripo upload failed with code ${body.code}`);
-      const token = body.data?.image_token;
-      if (!token) throw new Error('Tripo upload returned no file token');
-      files.push({ type: mime === 'image/jpeg' ? 'jpg' : 'png', file_token: token });
-    }
-    const submitted = await this.fetcher(`${this.baseUrl}/task`, {
-      method: 'POST', headers: { authorization: `Bearer ${this.apiKey}`, 'content-type': 'application/json', 'x-idempotency-key': request.idempotencyKey }, ...(signal ? { signal } : {}),
-      body: JSON.stringify({
-        type: 'multiview_to_model', files, model_version: this.revision,
-        pbr: true, texture: true, texture_quality: input.textureResolution === '4k' ? 'detailed' : 'standard',
-        texture_alignment: 'geometry', orientation: 'align_image', face_limit: input.faceLimit, model_seed: input.seed,
-        ...request.settings,
-      }),
-    });
-    if (!submitted.ok) throw new Error(`Tripo submission failed: ${submitted.status} ${await submitted.text()}`);
-    const submission = await submitted.json() as { code?: number; message?: string; data?: { task_id?: string } };
-    if (submission.code !== undefined && submission.code !== 0) throw new Error(submission.message ?? `Tripo submission failed with code ${submission.code}`);
-    const taskId = submission.data?.task_id;
-    if (!taskId) throw new Error('Tripo submission returned no task id');
-    let result: { status?: string; output?: { model?: string; pbr_model?: string }; error?: string } = {};
-    while (!['success', 'failed', 'cancelled', 'canceled'].includes(result.status ?? '')) {
-      await abortableDelay(this.pollIntervalMs, signal);
-      const poll = await this.fetcher(`${this.baseUrl}/task/${encodeURIComponent(taskId)}`, { headers: { authorization: `Bearer ${this.apiKey}` }, ...(signal ? { signal } : {}) });
-      if (!poll.ok) throw new Error(`Tripo result query failed: ${poll.status}`);
-      const body = await poll.json() as { data?: typeof result }; result = body.data ?? {};
-    }
-    if (result.status !== 'success') throw new Error(`Tripo task ${result.status}: ${result.error ?? 'unknown error'}`);
-    const source = result.output?.pbr_model ?? result.output?.model;
-    if (!source) throw new Error('Tripo task returned no GLB URL');
-    return { predictionId: taskId, outputs: [await downloadGlb(source, this.fetcher, signal)] };
-  }
-}
-
-export class MeshyMultiImageAdapter implements ProviderAdapter<MultiImageTo3DInput, PredictionOutput> {
-  readonly provider = 'meshy';
-  private readonly guard = new ProviderRequestGuard();
-
-  constructor(
-    readonly modelId: string,
-    readonly revision: string,
-    private readonly apiKey: string,
-    private readonly fetcher: typeof fetch = fetch,
-    private readonly baseUrl = 'https://api.meshy.ai/openapi/v1',
-    private readonly pollIntervalMs = 2_000,
-  ) {}
-
-  async checkCapabilities() { return { structuredOutput: false, imageInput: true, multiImageInput: true, pbr3d: true }; }
-  async estimate(): Promise<number> { throw new Error('Meshy cost must come from the reviewed provider profile'); }
-  async invoke(request: ProviderInvocation<MultiImageTo3DInput, PredictionOutput>, signal?: AbortSignal): Promise<PredictionOutput> {
-    return this.guard.invokeOnce(request.idempotencyKey, () => this.invokeRequest(request, signal));
-  }
-
-  private async invokeRequest(request: ProviderInvocation<MultiImageTo3DInput, PredictionOutput>, signal?: AbortSignal): Promise<PredictionOutput> {
-    if (!this.apiKey) throw new Error('MESHY_API_KEY is required');
-    const input = MultiImageTo3DInputSchema.parse(request.input);
-    rejectReservedSettings(request.settings, ['image_urls', 'ai_model', 'enable_pbr', 'texture_resolution', 'should_remesh', 'should_texture', 'topology', 'target_polycount', 'target_formats', 'image_enhancement', 'remove_lighting'], 'Meshy');
-    const response = await this.fetcher(`${this.baseUrl}/multi-image-to-3d`, {
-      method: 'POST', headers: { authorization: `Bearer ${this.apiKey}`, 'content-type': 'application/json', 'x-idempotency-key': request.idempotencyKey }, ...(signal ? { signal } : {}),
-      body: JSON.stringify({
-        image_urls: cardinalViews(input).map((image) => image.source), ai_model: this.revision,
-        enable_pbr: true, texture_resolution: input.textureResolution, should_remesh: true, should_texture: true,
-        topology: 'triangle', target_polycount: input.faceLimit, target_formats: ['glb'], image_enhancement: false, remove_lighting: true,
-        ...request.settings,
-      }),
-    });
-    if (!response.ok) throw new Error(`Meshy submission failed: ${response.status} ${await response.text()}`);
-    const submitted = await response.json() as { result?: string; id?: string };
-    const taskId = submitted.result ?? submitted.id;
-    if (!taskId) throw new Error('Meshy submission returned no task id');
-    let result: { status?: string; model_urls?: { glb?: string }; task_error?: { message?: string } } = {};
-    while (!['SUCCEEDED', 'FAILED', 'CANCELED'].includes(result.status ?? '')) {
-      await abortableDelay(this.pollIntervalMs, signal);
-      const poll = await this.fetcher(`${this.baseUrl}/multi-image-to-3d/${encodeURIComponent(taskId)}`, { headers: { authorization: `Bearer ${this.apiKey}` }, ...(signal ? { signal } : {}) });
-      if (!poll.ok) throw new Error(`Meshy result query failed: ${poll.status}`);
-      result = await poll.json() as typeof result;
-    }
-    if (result.status !== 'SUCCEEDED') throw new Error(`Meshy task ${result.status}: ${result.task_error?.message ?? 'unknown error'}`);
-    if (!result.model_urls?.glb) throw new Error('Meshy task returned no GLB URL');
-    return { predictionId: taskId, outputs: [await downloadGlb(result.model_urls.glb, this.fetcher, signal)] };
-  }
 }

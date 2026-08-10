@@ -20,6 +20,25 @@ describe('HTTP world bundle source', () => {
     expect(() => resolveBundleAssetUris({ ...external, prototypes: external.prototypes.map((prototype, index) => index === 0 ? { ...prototype, assetUri: 'javascript:alert(1)' } : prototype) }, new URL('https://world.test/bundle'))).toThrow('Unsafe asset URL');
   });
 
+  it('resolves every compiled terrain dependency and rejects unsafe terrain schemes', () => {
+    const original = createReferenceBundle();
+    const region = original.regions[0]!;
+    const material = { id: 'terrain-rock', name: 'Rock', biome: region.biome, baseColorUri: 'terrain/base.ktx2', normalUri: 'terrain/normal.ktx2', roughnessUri: 'terrain/roughness.ktx2', macroVariationUri: 'terrain/macro.ktx2', metersPerTile: 4 };
+    const terrainPlan = { schemaVersion: '1.0.0' as const, maskBlendMeters: 128, regions: [{ regionId: region.id, operators: [{ kind: 'ridge' as const, strength: 0.5, scaleMeters: 400, octaves: 4, offset: [0, 0] as [number, number] }], materialSetIds: [material.id] }], materialSets: [material], scatterRecipes: [], featureIds: [], referenceCameras: [] };
+    const compiled = {
+      ...original,
+      terrain: { kind: 'compiled-heightfield' as const, seed: original.seed, heightfieldUri: 'terrain/height.f32', contentHash: 'a'.repeat(64), samples: 257, encoding: 'float32' as const, terrainPlan, materialSets: [material], splatMapUris: ['terrain/splat.bin'], edits: [], footprintEdits: [] },
+      chunks: original.chunks.map((entry) => ({ ...entry, source: { kind: 'compiled-heightfield' as const, seed: original.seed, generator: 'worldengine-terrain-v2' as const, contentHash: entry.source.contentHash, heightfieldDependency: 'terrain/height.f32', splatDependencies: ['terrain/splat.bin'], textureDependencies: [material.baseColorUri, material.normalUri, material.roughnessUri, material.macroVariationUri] } })),
+    };
+    const resolved = resolveBundleAssetUris(compiled, new URL('https://world.test/v1/worlds/demo/bundle'));
+    expect(resolved.terrain?.kind).toBe('compiled-heightfield');
+    if (resolved.terrain?.kind !== 'compiled-heightfield') throw new Error('Expected compiled terrain');
+    expect(resolved.terrain.materialSets[0]?.baseColorUri).toBe('https://world.test/v1/worlds/demo/terrain/base.ktx2');
+    expect(resolved.chunks[0]?.source).toMatchObject({ heightfieldDependency: 'https://world.test/v1/worlds/demo/terrain/height.f32', textureDependencies: ['https://world.test/v1/worlds/demo/terrain/base.ktx2', 'https://world.test/v1/worlds/demo/terrain/normal.ktx2', 'https://world.test/v1/worlds/demo/terrain/roughness.ktx2', 'https://world.test/v1/worlds/demo/terrain/macro.ktx2'] });
+    const unsafe = { ...compiled, terrain: { ...compiled.terrain, materialSets: [{ ...material, normalUri: 'javascript:alert(1)' }] } };
+    expect(() => resolveBundleAssetUris(unsafe, new URL('https://world.test/v1/worlds/demo/bundle'))).toThrow('Unsafe asset URL');
+  });
+
   it('loads a versioned URI chunk only when byte length and SHA-256 match', async () => {
     const original = createReferenceBundle();
     const chunk = generateReferenceChunk(original, { x: 0, z: 0 }, { samples: 9 });

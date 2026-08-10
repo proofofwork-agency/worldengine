@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { CompileRequestSchema, PrototypeIdSchema, WorldDesignSpecSchema } from '@worldengine/schema';
-import { createReferenceDesignSpec, generateReferenceChunk, sampleWorldHeight } from '@worldengine/terrain';
+import { createReferenceDesignSpec, generateReferenceChunk, REFERENCE_SCATTER_INSTANCES_PER_CHUNK, sampleWorldHeight } from '@worldengine/terrain';
 import { compileLocalWorldArtifacts } from './authoring-compiler.js';
 import { referenceCamerasForRegion } from './composition.js';
 import { planLocalWorldDesign } from './local-planner.js';
@@ -42,7 +42,7 @@ describe('local canonical compiler pipeline', () => {
     const compileRequest = request();
     const spec = planLocalWorldDesign(compileRequest);
     const artifact = compileLocalWorldArtifacts(compileRequest, spec, new Date('2026-08-10T00:00:00.000Z'));
-    expect(artifact.authoringWorld.entities).toHaveLength(5_140);
+    expect(artifact.authoringWorld.entities).toHaveLength(REFERENCE_SCATTER_INSTANCES_PER_CHUNK * 256 + 20);
     expect(artifact.authoringWorld.entities.filter((entity) => entity.visualState['compositionPlaced'] === true)).toHaveLength(20);
     expect(artifact.authoringWorld.regionalCompositions).toHaveLength(5);
     expect(artifact.authoringWorld.regionalCompositions.flatMap((composition) => composition.objects)).toHaveLength(20);

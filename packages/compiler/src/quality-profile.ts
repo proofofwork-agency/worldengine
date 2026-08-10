@@ -61,7 +61,13 @@ export function assertQualityProfileRequest(request: CompileRequest): void {
     const requiredRoles: ProviderRole[] = ['planner', 'reviewer', 'composition-image', 'object-detection', 'segmentation', 'multiview-image', 'image-to-3d'];
     const missing = requiredRoles.filter((role) => providerForRole(request, role) === undefined);
     if (missing.length > 0) throw new Error(`Studio profile is missing provider/worker roles: ${missing.join(', ')}`);
-    if (!request.refinementPolicy.terrainCoDeformation || request.refinementPolicy.maxAssetRepairRounds < 1 || request.refinementPolicy.maxSceneRepairRounds < 1) {
+    const mesh = providerForRole(request, 'image-to-3d');
+    const compositionImage = providerForRole(request, 'composition-image');
+    const multiviewImage = providerForRole(request, 'multiview-image');
+    if (compositionImage?.provider.toLowerCase() !== 'openrouter-image' || compositionImage.modelId.toLowerCase() !== 'openai/gpt-image-2' || multiviewImage?.provider.toLowerCase() !== 'openrouter-image' || multiviewImage.modelId.toLowerCase() !== 'openai/gpt-image-2') throw new Error('Studio requires the fail-closed OpenRouter openai/gpt-image-2 image profile for composition and multiview');
+    if (mesh?.provider.toLowerCase() !== 'wavespeed' || mesh.modelId.toLowerCase() !== 'tripo3d/h3.1/multiview-to-3d') throw new Error('Studio requires the fail-closed WaveSpeed Tripo H3.1 multiview profile');
+    if (request.heroRegionIds.length === 0 || request.maxReferenceImages < request.heroRegionIds.length) throw new Error('Studio requires one regional image for every selected hero region');
+    if (!request.refinementPolicy.terrainCoDeformation || request.refinementPolicy.maxTerrainRounds < 1 || request.refinementPolicy.maxAssetAttempts < 2 || request.refinementPolicy.maxSceneRounds < 1 || request.refinementPolicy.maxCompositionAttempts < 2) {
       throw new Error('Studio profile requires bounded asset repair and terrain co-deformation');
     }
   }

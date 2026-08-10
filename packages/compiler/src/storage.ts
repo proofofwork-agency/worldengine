@@ -33,6 +33,13 @@ function safeReferenceExtension(value: string): 'png' | 'jpg' | 'webp' {
   return value;
 }
 
+export type TerrainArtifactExtension = 'png' | 'ktx2' | 'f32' | 'bin';
+
+function safeTerrainExtension(value: string): TerrainArtifactExtension {
+  if (value !== 'png' && value !== 'ktx2' && value !== 'f32' && value !== 'bin') throw new Error('Unsupported terrain artifact extension');
+  return value;
+}
+
 export interface WorldStorage {
   putBundle(bundle: VisualWorldBundle): Promise<string>;
   getBundle(worldId: string, version?: number): Promise<VisualWorldBundle>;
@@ -46,6 +53,8 @@ export interface WorldStorage {
   getAsset(worldId: string, contentHash: string): Promise<Uint8Array>;
   putReference(worldId: string, contentHash: string, extension: 'png' | 'jpg' | 'webp', bytes: Uint8Array, contentType: string): Promise<string>;
   getReference(worldId: string, contentHash: string, extension: 'png' | 'jpg' | 'webp'): Promise<Uint8Array>;
+  putTerrain(worldId: string, contentHash: string, extension: TerrainArtifactExtension, bytes: Uint8Array, contentType: string): Promise<string>;
+  getTerrain(worldId: string, contentHash: string, extension: TerrainArtifactExtension): Promise<Uint8Array>;
 }
 
 async function atomicJson(path: string, value: unknown): Promise<void> {
@@ -167,6 +176,17 @@ export class FileWorldStorage implements WorldStorage {
     worldId = safeWorldId(worldId); contentHash = safeContentHash(contentHash); extension = safeReferenceExtension(extension);
     return new Uint8Array(await readFile(join(this.root, 'worlds', worldId, 'references', `${contentHash}.${extension}`)));
   }
+
+  async putTerrain(worldId: string, contentHash: string, extension: TerrainArtifactExtension, bytes: Uint8Array, _contentType: string): Promise<string> {
+    worldId = safeWorldId(worldId); contentHash = safeContentHash(contentHash); extension = safeTerrainExtension(extension); assertContentHash(contentHash, bytes);
+    const path = join(this.root, 'worlds', worldId, 'terrain', `${contentHash}.${extension}`); await mkdir(dirname(path), { recursive: true });
+    const temporary = `${path}.${crypto.randomUUID()}.tmp`; await writeFile(temporary, bytes); await rename(temporary, path); return path;
+  }
+
+  async getTerrain(worldId: string, contentHash: string, extension: TerrainArtifactExtension): Promise<Uint8Array> {
+    worldId = safeWorldId(worldId); contentHash = safeContentHash(contentHash); extension = safeTerrainExtension(extension);
+    return new Uint8Array(await readFile(join(this.root, 'worlds', worldId, 'terrain', `${contentHash}.${extension}`)));
+  }
 }
 
 export interface S3CompatibleClient {
@@ -262,6 +282,16 @@ export class S3WorldStorage implements WorldStorage {
   async getReference(worldId: string, contentHash: string, extension: 'png' | 'jpg' | 'webp'): Promise<Uint8Array> {
     worldId = safeWorldId(worldId); contentHash = safeContentHash(contentHash); extension = safeReferenceExtension(extension);
     return this.client.getObject({ bucket: this.bucket, key: `${this.prefix}/worlds/${worldId}/references/${contentHash}.${extension}` });
+  }
+
+  async putTerrain(worldId: string, contentHash: string, extension: TerrainArtifactExtension, bytes: Uint8Array, contentType: string): Promise<string> {
+    worldId = safeWorldId(worldId); contentHash = safeContentHash(contentHash); extension = safeTerrainExtension(extension); assertContentHash(contentHash, bytes);
+    const key = `${this.prefix}/worlds/${worldId}/terrain/${contentHash}.${extension}`; await this.client.putObject({ bucket: this.bucket, key, body: bytes, contentType }); return `s3://${this.bucket}/${key}`;
+  }
+
+  async getTerrain(worldId: string, contentHash: string, extension: TerrainArtifactExtension): Promise<Uint8Array> {
+    worldId = safeWorldId(worldId); contentHash = safeContentHash(contentHash); extension = safeTerrainExtension(extension);
+    return this.client.getObject({ bucket: this.bucket, key: `${this.prefix}/worlds/${worldId}/terrain/${contentHash}.${extension}` });
   }
 
   private async put(key: string, value: unknown): Promise<void> {

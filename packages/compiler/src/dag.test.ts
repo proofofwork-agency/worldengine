@@ -2,10 +2,10 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { CompileRequestSchema } from '@worldengine/schema';
+import { CompileRequestSchema, jsonSchemas } from '@worldengine/schema';
 import { FileArtifactCache } from './artifact-cache.js';
 import { CompileDagExecutor, DagValidationError, MemoryDagCheckpointStore } from './dag.js';
-import { OpenAIImageAdapter, OpenRouterPlanningAdapter, WaveSpeedTripoAdapter } from './http-adapters.js';
+import { OpenAIImageAdapter, OpenRouterImageAdapter, OpenRouterPlanningAdapter, WaveSpeedTripoAdapter } from './http-adapters.js';
 import { DeterministicWorldCompiler } from './pipeline.js';
 
 let directory: string | undefined;
@@ -67,13 +67,62 @@ describe('provider HTTP contracts', () => {
   it('enforces no-fallback ZDR structured planning through OpenRouter', async () => {
     const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
       if (String(input).includes('/model/')) return new Response(JSON.stringify({ data: { supported_parameters: ['response_format'], architecture: { input_modalities: ['text', 'image'] } } }), { status: 200 });
-      const body = JSON.parse(String(init?.body)) as { provider: Record<string, unknown> };
+      const body = JSON.parse(String(init?.body)) as { provider: Record<string, unknown>; temperature?: unknown; response_format: { json_schema: { schema: { properties: { format: Record<string, unknown>; bounds: { properties: { min: Record<string, unknown> } } } } } } };
       expect(body.provider).toMatchObject({ allow_fallbacks: false, require_parameters: true, data_collection: 'deny', zdr: true });
+      expect(body).not.toHaveProperty('temperature');
+      expect(body.response_format.json_schema.schema.properties.bounds.properties.min).toMatchObject({ items: { type: 'number' }, minItems: 2, maxItems: 2 });
+      const containsTupleItems = (value: unknown): boolean => Array.isArray(value)
+        ? value.some(containsTupleItems)
+        : Boolean(value && typeof value === 'object' && (Array.isArray((value as Record<string, unknown>)['items']) || Object.values(value as Record<string, unknown>).some(containsTupleItems)));
+      expect(containsTupleItems(body.response_format.json_schema.schema)).toBe(false);
+      expect(body.response_format.json_schema.schema.properties.format).toMatchObject({ const: 'WorldDesignSpec' });
+      const containsUnsupportedSchemaKeyword = (value: unknown): boolean => {
+        if (Array.isArray(value)) return value.some(containsUnsupportedSchemaKeyword);
+        if (!value || typeof value !== 'object') return false;
+        const record = value as Record<string, unknown>;
+        const isSchemaNode = 'type' in record || 'anyOf' in record || '$ref' in record || '$schema' in record;
+        return (isSchemaNode && ('$schema' in record || 'default' in record || 'format' in record)) || Object.values(record).some(containsUnsupportedSchemaKeyword);
+      };
+      expect(containsUnsupportedSchemaKeyword(body.response_format.json_schema.schema)).toBe(false);
       return new Response(JSON.stringify({ choices: [{ message: { content: '{"ok":true}' } }] }), { status: 200 });
     }) as typeof fetch;
     const adapter = new OpenRouterPlanningAdapter('openai/test', 'r1', 'secret', fetcher, 'https://router.test');
     expect(await adapter.checkCapabilities()).toEqual({ structuredOutput: true, imageInput: true });
-    expect(await adapter.invoke({ provider: 'openrouter', modelId: 'openai/test', revision: 'r1', idempotencyKey: 'key', input: { messages: [{ role: 'user', content: 'plan' }], schemaName: 'plan', jsonSchema: { type: 'object' } }, settings: {} })).toEqual({ ok: true });
+    expect(await adapter.invoke({ provider: 'openrouter', modelId: 'openai/test', revision: 'r1', idempotencyKey: 'key', input: { messages: [{ role: 'user', content: 'plan' }], schemaName: 'plan', jsonSchema: jsonSchemas.worldDesignSpec as Record<string, unknown> }, settings: {} })).toEqual({ ok: true });
+  });
+
+  it('uses OpenRouter Images with reference inputs and fallback disabled', async () => {
+    const fetcher = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      if (String(input).endsWith('/images/models')) return Response.json({ data: [{ id: 'openai/gpt-image-2', architecture: { input_modalities: ['text', 'image'], output_modalities: ['image'] } }] });
+      expect(String(input)).toBe('https://router.test/images');
+      expect(init?.headers).toMatchObject({ 'x-idempotency-key': 'openrouter-image-key' });
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown> & { input_references: Array<{ image_url: { url: string } }>; provider: Record<string, unknown> };
+      expect(body).toMatchObject({ model: 'openai/gpt-image-2', quality: 'high', background: 'opaque', output_format: 'png', provider: { allow_fallbacks: false } });
+      expect(body.input_references[0]?.image_url.url).toMatch(/^data:image\/png;base64,/);
+      return Response.json({ data: [{ b64_json: 'aW1hZ2U=', media_type: 'image/png' }] });
+    }) as typeof fetch;
+    const adapter = new OpenRouterImageAdapter('openai/gpt-image-2', 'gpt-image-2-2026-04-21', 'secret', fetcher, 'https://router.test');
+    expect(await adapter.checkCapabilities()).toEqual({ structuredOutput: false, imageInput: true });
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).toString('base64');
+    const output = await adapter.invoke({
+      provider: 'openrouter-image', modelId: adapter.modelId, revision: adapter.revision, idempotencyKey: 'openrouter-image-key', settings: {},
+      input: { prompt: 'preserve terrain and add a village', size: '1536x1024', quality: 'high', background: 'opaque', n: 1, inputImages: [{ source: `data:image/png;base64,${png}`, contentType: 'image/png' }] },
+    });
+    expect(output).toEqual({ images: [{ base64: 'aW1hZ2U=' }] });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it('maps transparent image requests to OpenRouter-supported automatic backgrounds', async () => {
+    const fetcher = vi.fn(async (_input: string | URL | Request, init?: RequestInit) => {
+      const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+      expect(body.background).toBe('auto');
+      return Response.json({ data: [{ b64_json: 'aW1hZ2U=' }] });
+    }) as typeof fetch;
+    const adapter = new OpenRouterImageAdapter('openai/gpt-image-2', 'gpt-image-2-2026-04-21', 'secret', fetcher, 'https://router.test');
+    await adapter.invoke({
+      provider: 'openrouter-image', modelId: adapter.modelId, revision: adapter.revision, idempotencyKey: 'transparent-key', settings: {},
+      input: { prompt: 'isolated tree', size: '1024x1024', quality: 'high', background: 'transparent', n: 1, inputImages: [] },
+    });
   });
 
   it('uses the pinned OpenAI image revision and idempotency key', async () => {

@@ -70,12 +70,39 @@ test('exposes fail-closed server-side BYOK status and responsive keyboard naviga
   await expect(page.getByLabel('Inspected chunk')).toHaveValue(/^-?\d+:-?\d+$/);
   const navigation = page.getByLabel('Camera focus coordinates');
   const home = await navigation.textContent();
+  const coordinates = (value: string | null) => {
+    const match = value?.match(/X (-?\d+).*Z (-?\d+)/);
+    return [Number(match?.[1]), Number(match?.[2])] as const;
+  };
+  const movedDistance = (value: string | null) => {
+    const [homeX, homeZ] = coordinates(home);
+    const [x, z] = coordinates(value);
+    return Math.hypot(x - homeX, z - homeZ);
+  };
   await page.keyboard.down('w');
   await page.waitForTimeout(250);
   await page.keyboard.up('w');
   await expect(navigation).not.toHaveText(home!);
+  const straight = await navigation.textContent();
+  expect(movedDistance(straight)).toBeGreaterThan(0);
   await page.keyboard.press('r');
   await expect(navigation).toHaveText(home!);
+
+  const canvas = page.getByLabel('3D world viewport');
+  const bounds = await canvas.boundingBox();
+  expect(bounds).not.toBeNull();
+  const startX = bounds!.x + bounds!.width * 0.35; const startY = bounds!.y + bounds!.height * 0.5;
+  await page.mouse.move(startX, startY); await page.mouse.down(); await page.mouse.move(Math.min(bounds!.x + bounds!.width - 8, startX + 300), startY, { steps: 8 }); await page.mouse.up();
+  await page.keyboard.down('w'); await page.waitForTimeout(250); await page.keyboard.up('w');
+  await expect(navigation).not.toHaveText(home!);
+  expect(movedDistance(await navigation.textContent())).toBeGreaterThan(0);
+  await page.keyboard.press('r'); await expect(navigation).toHaveText(home!);
+
+  const thirdPerson = page.getByRole('button', { name: 'Third person' });
+  const rts = page.getByRole('button', { name: 'RTS' });
+  await thirdPerson.click(); await expect(thirdPerson).toHaveClass(/active/);
+  await rts.click(); await expect(rts).toHaveClass(/active/);
+  await page.getByRole('button', { name: 'SANDBOX' }).click();
 });
 
 test('loads canonical compiler artifacts and persists a revisioned editor patch', async ({ page }) => {

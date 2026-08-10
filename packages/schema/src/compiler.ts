@@ -6,6 +6,7 @@ import { AssetLodSchema } from './authoring.js';
 import { ProvenanceRecordSchema } from './provenance.js';
 import { PrototypeIdSchema } from './primitives.js';
 import { ProviderRoleSchema, QualityProfileSchema, RefinementPolicySchema } from './quality.js';
+import { GenerationArtifactSchema, GenerationAttemptSchema, RefinementDecisionSchema } from './generation.js';
 
 export const AssetLibraryEntrySchema = z.object({
   id: PrototypeIdSchema,
@@ -101,7 +102,7 @@ export type ChunkCompileRequest = z.infer<typeof ChunkCompileRequestSchema>;
 export const CompileEventSchema = z.object({
   sequence: z.number().int().nonnegative(),
   compileId: z.string().min(1),
-  type: z.enum(['queued', 'phase-started', 'progress', 'artifact', 'cost', 'completed', 'failed', 'cancelled']),
+  type: z.enum(['queued', 'phase-started', 'progress', 'artifact', 'cost', 'needs-attention', 'completed', 'failed', 'cancelled']),
   phase: z.string().optional(),
   progress: z.number().min(0).max(1),
   message: z.string(),
@@ -109,6 +110,21 @@ export const CompileEventSchema = z.object({
   data: z.record(z.string(), z.unknown()).default({}),
 });
 export type CompileEvent = z.infer<typeof CompileEventSchema>;
+
+export const CompileArtifactCatalogSchema = z.object({
+  compileId: z.string().min(1),
+  artifacts: z.array(GenerationArtifactSchema).default([]),
+  attempts: z.array(GenerationAttemptSchema).default([]),
+  decisions: z.array(RefinementDecisionSchema).default([]),
+  updatedAt: z.string().datetime(),
+});
+export type CompileArtifactCatalog = z.infer<typeof CompileArtifactCatalogSchema>;
+
+export const ResumeCompileRequestSchema = z.object({
+  maxCostUsd: z.number().positive().max(100),
+  confirmed: z.literal(true),
+});
+export type ResumeCompileRequest = z.infer<typeof ResumeCompileRequestSchema>;
 
 export type RegenerationPatch = z.infer<typeof WorldPatchSchema>;
 

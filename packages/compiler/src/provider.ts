@@ -1,4 +1,5 @@
-import { createHash } from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { createHash, randomUUID } from 'node:crypto';
 
 export interface ProviderInvocation<TInput, TOutput> {
   provider: string;
@@ -54,9 +55,60 @@ export interface ProviderModelSelection {
   revision: string;
 }
 
+export type ProviderInvocationPhase = 'terrain' | 'composition' | 'segmentation' | 'multiview' | 'reconstruction' | 'asset-validation' | 'placement' | 'scene-refinement' | 'review' | 'publication';
+
+export interface ProviderInvocationAccountingRecord extends ProviderModelSelection {
+  id: string;
+  phase: ProviderInvocationPhase;
+  index: number;
+  status: 'passed' | 'failed' | 'cancelled';
+  idempotencyKeyHash: string;
+  reservedCostUsd: number;
+  actualCostUsd: number;
+  startedAt: string;
+  completedAt: string;
+  rejectionReason?: string;
+}
+
+export interface ProviderAccountingSession {
+  readonly capUsd: number;
+  readonly previousActualCostUsd: number;
+  readonly unitCostUsd: (selection: ProviderModelSelection) => number;
+  readonly attempts: ProviderInvocationAccountingRecord[];
+  reservedCostUsd: number;
+  actualCostUsd: number;
+}
+
+interface ProviderAccountingContext {
+  session: ProviderAccountingSession;
+  seen: Set<string>;
+  runId: string;
+}
+
+export class ProviderCostCapError extends Error {
+  readonly code = 'COST_CAP_EXCEEDED';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'ProviderCostCapError';
+  }
+}
+
+export function createProviderAccountingSession(input: {
+  capUsd: number;
+  previousActualCostUsd?: number;
+  unitCostUsd(selection: ProviderModelSelection): number;
+}): ProviderAccountingSession {
+  if (!Number.isFinite(input.capUsd) || input.capUsd < 0) throw new Error('Provider accounting cap must be a finite non-negative amount');
+  const previousActualCostUsd = input.previousActualCostUsd ?? 0;
+  if (!Number.isFinite(previousActualCostUsd) || previousActualCostUsd < 0) throw new Error('Previous provider cost must be a finite non-negative amount');
+  return { capUsd: input.capUsd, previousActualCostUsd, unitCostUsd: input.unitCostUsd, attempts: [], reservedCostUsd: 0, actualCostUsd: 0 };
+}
+
 export class ProviderExecutionRegistry {
   private readonly adapters = new Map<string, ProviderAdapter<never, unknown>>();
   private readonly capabilities = new Map<string, Promise<ProviderCapabilities>>();
+  private readonly accounting = new AsyncLocalStorage<ProviderAccountingContext>();
 
   constructor(adapters: readonly ProviderAdapter<unknown, unknown>[] = []) {
     adapters.forEach((adapter) => this.register(adapter));
@@ -88,9 +140,63 @@ export class ProviderExecutionRegistry {
     if (required.segmentation && !available.segmentation) throw new Error(`${key} does not support required segmentation`);
   }
 
-  invoke<TInput, TOutput>(selection: ProviderModelSelection, input: TInput, settings: Record<string, unknown>, idempotencyKey: string, signal?: AbortSignal): Promise<TOutput> {
+  withAccounting<T>(session: ProviderAccountingSession, operation: () => Promise<T>): Promise<T> {
+    return this.accounting.run({ session, seen: new Set(), runId: randomUUID() }, operation);
+  }
+
+  async invoke<TInput, TOutput>(selection: ProviderModelSelection, input: TInput, settings: Record<string, unknown>, idempotencyKey: string, signal?: AbortSignal, phase: ProviderInvocationPhase = 'review'): Promise<TOutput> {
     const adapter = this.requireAdapter(selection) as unknown as ProviderAdapter<TInput, TOutput>;
-    return adapter.invoke({ provider: selection.provider, modelId: selection.modelId, revision: selection.revision, input, settings, idempotencyKey }, signal);
+    const context = this.accounting.getStore();
+    const accountingKey = `${this.key(selection)}::${idempotencyKey}`;
+    let attempt: ProviderInvocationAccountingRecord | undefined;
+    if (context && !context.seen.has(accountingKey)) {
+      const unitCostUsd = context.session.unitCostUsd(selection);
+      if (!Number.isFinite(unitCostUsd) || unitCostUsd < 0) throw new Error(`Provider policy returned an invalid unit cost for ${selection.provider}/${selection.modelId}@${selection.revision}`);
+      const cumulativeReservedUsd = context.session.previousActualCostUsd + context.session.reservedCostUsd + unitCostUsd;
+      if (cumulativeReservedUsd > context.session.capUsd + Number.EPSILON) {
+        throw new ProviderCostCapError(`Provider action would reserve $${cumulativeReservedUsd.toFixed(2)} against cap $${context.session.capUsd.toFixed(2)}`);
+      }
+      context.seen.add(accountingKey);
+      context.session.reservedCostUsd += unitCostUsd;
+      const startedAt = new Date().toISOString();
+      const idempotencyKeyHash = createHash('sha256').update(idempotencyKey).digest('hex');
+      attempt = {
+        id: `provider-${createHash('sha256').update(`${context.runId}:${accountingKey}`).digest('hex').slice(0, 24)}`,
+        phase,
+        index: context.session.attempts.length,
+        status: 'failed',
+        provider: selection.provider,
+        modelId: selection.modelId,
+        revision: selection.revision,
+        idempotencyKeyHash,
+        reservedCostUsd: unitCostUsd,
+        actualCostUsd: 0,
+        startedAt,
+        completedAt: startedAt,
+      };
+      context.session.attempts.push(attempt);
+    }
+    try {
+      const output = await adapter.invoke({ provider: selection.provider, modelId: selection.modelId, revision: selection.revision, input, settings, idempotencyKey }, signal);
+      if (attempt && context) {
+        attempt.status = 'passed';
+        attempt.actualCostUsd = attempt.reservedCostUsd;
+        attempt.completedAt = new Date().toISOString();
+        context.session.actualCostUsd += attempt.actualCostUsd;
+      }
+      return output;
+    } catch (value) {
+      if (attempt && context) {
+        attempt.status = signal?.aborted ? 'cancelled' : 'failed';
+        // Reviewed policy unit prices are used as the conservative charged cost
+        // because provider adapters do not expose authoritative invoice data.
+        attempt.actualCostUsd = attempt.reservedCostUsd;
+        attempt.completedAt = new Date().toISOString();
+        attempt.rejectionReason = value instanceof Error ? value.message : String(value);
+        context.session.actualCostUsd += attempt.actualCostUsd;
+      }
+      throw value;
+    }
   }
 
   private requireAdapter(selection: ProviderModelSelection): ProviderAdapter<never, unknown> {

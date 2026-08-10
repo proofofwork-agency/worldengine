@@ -16,10 +16,16 @@ export const ProviderRoleSchema = z.enum([
 export type ProviderRole = z.infer<typeof ProviderRoleSchema>;
 
 export const RefinementPolicySchema = z.object({
+  maxTerrainRounds: z.number().int().min(0).max(3).default(3),
+  maxCompositionAttempts: z.number().int().min(1).max(3).default(3),
+  maxAssetAttempts: z.number().int().min(1).max(2).default(2),
+  maxSceneRounds: z.number().int().min(0).max(3).default(3),
+  /** @deprecated Read-time compatibility for 1.1 requests. */
   maxAssetRepairRounds: z.number().int().min(0).max(2).default(0),
+  /** @deprecated Read-time compatibility for 1.1 requests. */
   maxSceneRepairRounds: z.number().int().min(0).max(1).default(0),
   terrainCoDeformation: z.boolean().default(false),
-}).default({ maxAssetRepairRounds: 0, maxSceneRepairRounds: 0, terrainCoDeformation: false });
+}).default({ maxTerrainRounds: 3, maxCompositionAttempts: 3, maxAssetAttempts: 2, maxSceneRounds: 3, maxAssetRepairRounds: 0, maxSceneRepairRounds: 0, terrainCoDeformation: false });
 export type RefinementPolicy = z.infer<typeof RefinementPolicySchema>;
 
 export const QualityDimensionSchema = z.enum([

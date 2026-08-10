@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { TransformSchema, Vec2Schema, Vec3Schema, WorldPatchSchema, type RegionSpec, type Vec2, type Vec3, type WorldPatch } from '@worldengine/schema';
+import { CalibratedRegionalCameraSchema, TransformSchema, Vec2Schema, Vec3Schema, WorldPatchSchema, type CalibratedRegionalCamera, type RegionSpec, type Vec2, type Vec3, type WorldPatch } from '@worldengine/schema';
 
 export interface RasterMask {
   width: number;
@@ -73,6 +73,25 @@ export function referenceCamerasForRegion(region: Pick<RegionSpec, 'id' | 'polyg
   });
 }
 
+export function calibrateReferenceCamera(camera: ReferenceCamera, regionId: RegionSpec['id']): CalibratedRegionalCamera {
+  const forward = normalize(subtract(camera.target, camera.position));
+  const right = normalize(cross(forward, camera.up));
+  const up = normalize(cross(right, forward));
+  const fx = camera.height / (2 * Math.tan(camera.verticalFovDegrees * Math.PI / 360));
+  const worldToCamera = [
+    right[0], up[0], -forward[0], 0,
+    right[1], up[1], -forward[1], 0,
+    right[2], up[2], -forward[2], 0,
+    -dot(right, camera.position), -dot(up, camera.position), dot(forward, camera.position), 1,
+  ] as const;
+  return CalibratedRegionalCameraSchema.parse({
+    ...camera,
+    regionId,
+    intrinsics: { fx, fy: fx, cx: camera.width / 2, cy: camera.height / 2 },
+    worldToCamera,
+  });
+}
+
 export const ObjectDescriptorSchema = z.object({
   id: z.string().min(1),
   assetClass: z.string().min(1),
@@ -81,6 +100,11 @@ export const ObjectDescriptorSchema = z.object({
   desiredHeightMeters: z.number().positive(),
   isolatedReferenceUri: z.string().url().optional(),
   tags: z.array(z.string()).default([]),
+  cropTransform: z.object({
+    compositionToCrop: z.tuple([z.number(), z.number(), z.number(), z.number(), z.number(), z.number()]),
+    cropToComposition: z.tuple([z.number(), z.number(), z.number(), z.number(), z.number(), z.number()]),
+    sourceBox: z.object({ x: z.number(), y: z.number(), width: z.number().positive(), height: z.number().positive() }),
+  }).optional(),
 });
 export type ObjectDescriptor = z.infer<typeof ObjectDescriptorSchema>;
 
@@ -135,6 +159,74 @@ export function placeObjectFromComposition(descriptorInput: ObjectDescriptor, ca
   return TransformSchema.parse({ position: hit, rotation: [0, 0, 0, 1], scale: [uniformScale, uniformScale, uniformScale] });
 }
 
+export interface CompositionPreservationMetrics {
+  structuralSimilarityOutsideObjects: number;
+  terrainMaskOverlap: number;
+  cameraLandmarkDriftPixels: number;
+  passed: boolean;
+}
+
+export function measureCompositionPreservation(input: {
+  sourceRgba: Uint8Array;
+  candidateRgba: Uint8Array;
+  width: number;
+  height: number;
+  objectBoxes?: ReadonlyArray<{ x: number; y: number; width: number; height: number }>;
+  sourceTerrainMask?: Uint8Array;
+  candidateTerrainMask?: Uint8Array;
+  sourceLandmarks?: readonly Vec2[];
+  candidateLandmarks?: readonly Vec2[];
+}): CompositionPreservationMetrics {
+  const pixels = input.width * input.height;
+  if (input.sourceRgba.length !== pixels * 4 || input.candidateRgba.length !== pixels * 4) throw new Error('Composition RGBA dimensions do not match');
+  const boxes = input.objectBoxes ?? [];
+  let difference = 0; let compared = 0;
+  for (let index = 0; index < pixels; index += 1) {
+    const x = index % input.width; const y = Math.floor(index / input.width);
+    if (boxes.some((box) => x >= box.x && x < box.x + box.width && y >= box.y && y < box.y + box.height)) continue;
+    const offset = index * 4;
+    difference += Math.abs(input.sourceRgba[offset]! - input.candidateRgba[offset]!) + Math.abs(input.sourceRgba[offset + 1]! - input.candidateRgba[offset + 1]!) + Math.abs(input.sourceRgba[offset + 2]! - input.candidateRgba[offset + 2]!);
+    compared += 3;
+  }
+  const structuralSimilarityOutsideObjects = compared === 0 ? 1 : Math.max(0, 1 - difference / (compared * 255));
+  let terrainMaskOverlap = 1;
+  if (input.sourceTerrainMask || input.candidateTerrainMask) {
+    if (!input.sourceTerrainMask || !input.candidateTerrainMask || input.sourceTerrainMask.length !== pixels || input.candidateTerrainMask.length !== pixels) throw new Error('Terrain masks must both match composition dimensions');
+    let intersection = 0; let union = 0;
+    for (let index = 0; index < pixels; index += 1) {
+      const source = input.sourceTerrainMask[index]! > 127; const candidate = input.candidateTerrainMask[index]! > 127;
+      if (source && candidate) intersection += 1;
+      if (source || candidate) union += 1;
+    }
+    terrainMaskOverlap = union === 0 ? 1 : intersection / union;
+  }
+  const sourceLandmarks = input.sourceLandmarks ?? []; const candidateLandmarks = input.candidateLandmarks ?? [];
+  if (sourceLandmarks.length !== candidateLandmarks.length) throw new Error('Camera landmark sets must have equal length');
+  const cameraLandmarkDriftPixels = sourceLandmarks.reduce((maximum, point, index) => Math.max(maximum, Math.hypot(point[0] - candidateLandmarks[index]![0], point[1] - candidateLandmarks[index]![1])), 0);
+  return { structuralSimilarityOutsideObjects, terrainMaskOverlap, cameraLandmarkDriftPixels, passed: structuralSimilarityOutsideObjects >= 0.9 && terrainMaskOverlap >= 0.95 && cameraLandmarkDriftPixels <= 8 };
+}
+
+export function silhouetteFitMetrics(target: Uint8Array, candidate: Uint8Array, width: number, height: number): { iou: number; centerErrorPixels: number; passed: boolean } {
+  if (target.length !== width * height || candidate.length !== target.length) throw new Error('Silhouette masks do not match dimensions');
+  let intersection = 0; let union = 0; let targetX = 0; let targetY = 0; let targetCount = 0; let candidateX = 0; let candidateY = 0; let candidateCount = 0;
+  for (let index = 0; index < target.length; index += 1) {
+    const a = target[index]! > 127; const b = candidate[index]! > 127; const x = index % width; const y = Math.floor(index / width);
+    if (a && b) intersection += 1;
+    if (a || b) union += 1;
+    if (a) { targetX += x; targetY += y; targetCount += 1; }
+    if (b) { candidateX += x; candidateY += y; candidateCount += 1; }
+  }
+  const iou = union === 0 ? 1 : intersection / union;
+  const centerErrorPixels = targetCount === 0 && candidateCount === 0 ? 0 : targetCount === 0 || candidateCount === 0 ? Number.POSITIVE_INFINITY : Math.hypot(targetX / targetCount - candidateX / candidateCount, targetY / targetCount - candidateY / candidateCount);
+  return { iou, centerErrorPixels, passed: iou >= 0.85 && centerErrorPixels <= 4 };
+}
+
+export function terrainContactMeasurement(points: readonly Vec3[], sampleHeight: (x: number, z: number) => number, organic: boolean): { maximumErrorMeters: number; passed: boolean } {
+  if (points.length === 0) throw new Error('Contact measurement requires mesh contact points');
+  const maximumErrorMeters = points.reduce((maximum, point) => Math.max(maximum, Math.abs(point[1] - sampleHeight(point[0], point[2]))), 0);
+  return { maximumErrorMeters, passed: maximumErrorMeters <= (organic ? 0.05 : 0.02) };
+}
+
 export function validateVisualReviewPatch(input: unknown, worldId: string, baseRevision: number): WorldPatch {
   const patch = WorldPatchSchema.parse(input);
   if (patch.worldId !== worldId) throw new Error('Visual review patch targets a different world');
@@ -152,3 +244,4 @@ function scale(vector: Vec3, scalar: number): Vec3 { return [vector[0] * scalar,
 function length(vector: Vec3): number { return Math.hypot(vector[0], vector[1], vector[2]); }
 function normalize(vector: Vec3): Vec3 { const magnitude = length(vector); return magnitude === 0 ? [0, 0, 0] : scale(vector, 1 / magnitude); }
 function cross(a: Vec3, b: Vec3): Vec3 { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
+function dot(a: Vec3, b: Vec3): number { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }

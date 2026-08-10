@@ -8,9 +8,9 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc -p tsconfig.json --noEmit",
     "dev": "tsx watch src/main.ts",
-    "dev:configured": "node --env-file=.env.local --import tsx src/main.ts",
+    "dev:configured": "node --env-file-if-exists=.env --env-file-if-exists=.env.local --import tsx src/main.ts",
     "start": "node dist/main.js",
-    "start:configured": "node --env-file=.env.local dist/main.js",
+    "start:configured": "node --env-file-if-exists=.env --env-file-if-exists=.env.local dist/main.js",
     "reference:build": "tsx src/reference-build.ts",
     "provider:check": "tsx src/provider-policy-check.ts",
     "test:providers:live": "tsx src/live-provider-smoke.ts"

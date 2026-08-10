@@ -9,11 +9,11 @@ import { ThreeRendererBackend } from './backend.js';
 function chunkWithUnknownPrototype(): RuntimeChunk {
   return {
     format: 'RuntimeChunk',
-    version: '1.1.0',
+    version: '1.2.0',
     id: ChunkIdSchema.parse('0:0'),
     coordinate: { x: 0, z: 0 },
     bounds: { min: [0, 0], max: [256, 256] },
-    terrain: { samples: 3, heights: new Float32Array(9), minHeight: 0, maxHeight: 0 },
+    terrain: { samples: 3, heights: new Float32Array(9), minHeight: 0, maxHeight: 0, materialSplats: [], textureDependencies: [] },
     instances: [{
       id: EntityIdSchema.parse('unknown-instance'),
       prototypeId: PrototypeIdSchema.parse('prototype-does-not-exist'),
@@ -273,7 +273,7 @@ describe('ThreeRendererBackend chunk transactions', () => {
     }));
     const chunk: RuntimeChunk = {
       ...chunkWithUnknownPrototype(),
-      terrain: { samples, heights, minHeight: -8, maxHeight: 8, biomeWeights: new Uint8Array(samples * samples) },
+      terrain: { samples, heights, minHeight: -8, maxHeight: 8, biomeWeights: new Uint8Array(samples * samples), materialSplats: [], textureDependencies: [] },
       instances,
       dependencies: [prototype.id],
     };
@@ -300,7 +300,7 @@ describe('ThreeRendererBackend chunk transactions', () => {
     }));
     const chunk: RuntimeChunk = {
       ...chunkWithUnknownPrototype(),
-      terrain: { samples, heights: new Float32Array(samples * samples), minHeight: 0, maxHeight: 0, biomeWeights: new Uint8Array(samples * samples) },
+      terrain: { samples, heights: new Float32Array(samples * samples), minHeight: 0, maxHeight: 0, biomeWeights: new Uint8Array(samples * samples), materialSplats: [], textureDependencies: [] },
       instances,
       dependencies: [prototype.id],
     };

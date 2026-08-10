@@ -19,13 +19,13 @@ import { createReferenceBundle, generateReferenceChunk, generateReferenceChunkAs
 import type { ArtifactCache } from './artifact-cache.js';
 import type { BinaryArtifactStore } from './binary-artifact.js';
 import { compileLocalWorldArtifacts, type CompiledWorldArtifacts } from './authoring-compiler.js';
-import { prepareCloudCompile, reviewCloudArtifacts, type CloudPreparation, type StagedBinaryArtifact } from './cloud-pipeline.js';
+import { prepareCloudCompile, refineStudioRegions, reviewCloudArtifacts, type CloudPreparation, type StagedBinaryArtifact } from './cloud-pipeline.js';
 import { CompileDagExecutor, type DagCheckpointStore, type DagNode } from './dag.js';
 import { assertCostBudget, ProviderPolicyError, ProviderPolicyRegistry } from './legal.js';
 import { planLocalWorldDesign } from './local-planner.js';
 import { rasterizeRegions } from './composition.js';
 import { assertValidBundle } from './validation.js';
-import { ProviderExecutionRegistry } from './provider.js';
+import { createProviderAccountingSession, ProviderExecutionRegistry } from './provider.js';
 import { assertQualityProfileRequest } from './quality-profile.js';
 import type { StudioWorkerRegistry } from './studio-workers.js';
 
@@ -63,8 +63,8 @@ export class DeterministicWorldCompiler implements WorldCompiler {
     return this.runCompile(CompileRequestSchema.parse(request), compileId, new AbortController().signal);
   }
 
-  compileWithSignal(request: CompileRequest, compileId: string, signal: AbortSignal): AsyncIterable<CompileEvent> {
-    return this.runCompile(CompileRequestSchema.parse(request), compileId, signal);
+  compileWithSignal(request: CompileRequest, compileId: string, signal: AbortSignal, previousActualCostUsd = 0): AsyncIterable<CompileEvent> {
+    return this.runCompile(CompileRequestSchema.parse(request), compileId, signal, previousActualCostUsd);
   }
 
   regenerate(request: RegenerateRequest, compileId: string = randomUUID()): AsyncIterable<CompileEvent> {
@@ -130,7 +130,7 @@ export class DeterministicWorldCompiler implements WorldCompiler {
     yield emit('completed', 'complete', 1, 'Explicit sparse chunk compile completed', { coordinate: { x: request.x, z: request.z }, chunkId: chunk.id });
   }
 
-  private async *runCompile(request: CompileRequest, compileId: string, signal: AbortSignal): AsyncIterable<CompileEvent> {
+  private async *runCompile(request: CompileRequest, compileId: string, signal: AbortSignal, previousActualCostUsd = 0): AsyncIterable<CompileEvent> {
     let sequence = 0;
     const emit = (type: CompileEvent['type'], phase: string, progress: number, message: string, data: Record<string, unknown> = {}): CompileEvent => CompileEventSchema.parse({
       sequence: sequence++, compileId, type, phase, progress, message, timestamp: new Date().toISOString(), data,
@@ -140,14 +140,21 @@ export class DeterministicWorldCompiler implements WorldCompiler {
       assertQualityProfileRequest(request);
       this.policies.assertCompileAllowed(request);
       const estimate = this.policies.estimateMaximumCost(request);
-      assertCostBudget(request, estimate);
-      yield emit('cost', 'cost-gate', 0.04, request.dryRun ? 'Dry-run estimate complete' : 'Cost cap confirmed', { estimatedCostUsd: estimate, maxCostUsd: request.maxCostUsd });
+      assertCostBudget(request, previousActualCostUsd + estimate);
+      yield emit('cost', 'cost-gate', 0.04, request.dryRun ? 'Dry-run estimate complete' : 'Cost cap confirmed', {
+        estimatedCostUsd: estimate,
+        previousActualCostUsd,
+        maximumTotalCostUsd: previousActualCostUsd + estimate,
+        reservedCostUsd: previousActualCostUsd,
+        actualCostUsd: previousActualCostUsd,
+        maxCostUsd: request.maxCostUsd,
+      });
       if (!request.dryRun && request.providerModels.length > 0 && (!this.providerExecutionConfigured || !this.binaryArtifacts)) throw new ProviderPolicyError('PROVIDER_EXECUTION_NOT_CONFIGURED', 'Reviewed provider models require explicitly configured provider execution and binary artifact registries');
       const promptHash = createHash('sha256').update(request.prompt).digest('hex');
       const cacheKey = createHash('sha256').update(JSON.stringify({
         format: 'worldengine-compile-v8',
         assetOptimization: { meshLods: 'meshoptimizer-1.2.0', textures: 'ktx2-encoder-0.6.0-basis-1b33fd5' },
-        reviewDiagnostics: { glb: 'cpu-glb-diagnostic-1.0.0', placement: 'cpu-placement-diagnostic-1.1.0-camera-aligned' },
+        reviewDiagnostics: { glb: 'cpu-glb-diagnostic-1.0.0', placement: 'cpu-placement-diagnostic-1.2.0-calibrated' },
         execution: request.dryRun ? 'dry-run' : 'execute',
         prompt: request.prompt,
         seed: request.seed,
@@ -179,7 +186,9 @@ export class DeterministicWorldCompiler implements WorldCompiler {
         } },
         { id: 'region-map', dependencies: ['requirements'], run: async ({ output, signal: nodeSignal }) => {
           nodeSignal.throwIfAborted();
-          const spec = output<CloudPreparation>('requirements').designSpec;
+          const preparation = output<CloudPreparation>('requirements');
+          if (preparation.failure) throw new Error(preparation.failure);
+          const spec = preparation.designSpec;
           const mask = rasterizeRegions(spec.regions, spec.bounds, 256, 256);
           return { width: mask.width, height: mask.height, assignedPixels: [...mask.values].filter((value) => value !== 0).length, regionIds: mask.regionIds, roads: spec.features.filter((feature) => feature.kind === 'road').length, rivers: spec.features.filter((feature) => feature.kind === 'river').length, coastlines: spec.features.filter((feature) => feature.kind === 'coastline').length };
         } },
@@ -205,8 +214,14 @@ export class DeterministicWorldCompiler implements WorldCompiler {
           if (contactErrors > 0) throw new Error(`${contactErrors} procedural placements failed terrain contact validation`);
           return { deterministicInstances: artifact.authoringWorld.entities.length, terrainContactValidated: true };
         } },
-        { id: 'visual-review', dependencies: ['placement'], run: async ({ output, signal: nodeSignal }) => {
-          const artifact = await reviewCloudArtifacts(output<CompiledWorldArtifacts>('terrain'), output<CloudPreparation>('requirements'), request, this.providers, this.binaryArtifacts, nodeSignal);
+        { id: 'region-refinement', dependencies: ['placement'], run: async ({ output, signal: nodeSignal }) => {
+          const artifact = output<CompiledWorldArtifacts>('terrain');
+          if (request.qualityProfile !== 'studio') return artifact;
+          if (!this.binaryArtifacts) throw new Error('Studio region refinement requires binary artifact storage');
+          return refineStudioRegions(artifact, output<CloudPreparation>('requirements'), request, this.binaryArtifacts, this.studioWorkers ?? {}, nodeSignal);
+        } },
+        { id: 'visual-review', dependencies: ['region-refinement'], run: async ({ output, signal: nodeSignal }) => {
+          const artifact = await reviewCloudArtifacts(output<CompiledWorldArtifacts>('region-refinement'), output<CloudPreparation>('requirements'), request, this.providers, this.binaryArtifacts, nodeSignal);
           AuthoringWorldSchema.parse(artifact.authoringWorld);
           assertValidBundle(artifact.bundle);
           return artifact;
@@ -214,15 +229,42 @@ export class DeterministicWorldCompiler implements WorldCompiler {
         { id: 'optimization', dependencies: ['visual-review'], run: async ({ output }) => {
           const artifact = output<CompiledWorldArtifacts>('visual-review');
           if (!artifact.bundle.optimization.instanceGroups || !artifact.bundle.optimization.occlusionMetadata) throw new Error('Local bundle optimization metadata is incomplete');
+          if (request.qualityProfile === 'studio') {
+            if (artifact.bundle.terrain?.kind !== 'compiled-heightfield') throw new Error('Studio publication requires compiled-heightfield terrain');
+            const terrainTextureUris = artifact.bundle.terrain.materialSets.flatMap((material) => [material.baseColorUri, material.normalUri, material.roughnessUri, material.macroVariationUri]);
+            if (terrainTextureUris.some((uri) => !uri.toLowerCase().endsWith('.ktx2'))) throw new Error('Studio publication requires KTX2 PBR terrain textures');
+            const heroRegions = new Set(request.heroRegionIds);
+            const prototypes = new Map(artifact.bundle.prototypes.map((prototype) => [prototype.id, prototype]));
+            const primitiveHeroEntities = artifact.authoringWorld.entities.filter((entity) => heroRegions.has(entity.regionId ?? '') && prototypes.get(entity.prototypeId)?.assetUri.startsWith('primitive://'));
+            if (primitiveHeroEntities.length > 0) throw new Error(`Studio hero regions contain ${primitiveHeroEntities.length} visible primitive placeholders`);
+          }
           return artifact;
         } },
       ];
-      const results = await this.dag.execute(compileId, nodes, request, signal);
-      const progressByPhase: Record<string, number> = { requirements: 0.14, 'region-map': 0.28, terrain: 0.42, composition: 0.56, placement: 0.7, 'visual-review': 0.82, optimization: 0.92 };
-      for (const result of results) {
-        if (result.status !== 'completed') throw new Error(`Compile DAG ${result.id} ${result.status}: ${result.error ?? 'unknown error'}`);
-        yield emit('progress', result.id, progressByPhase[result.id] ?? 0.5, `Completed ${result.id}`, { checkpointed: true });
+      const accounting = createProviderAccountingSession({
+        capUsd: request.maxCostUsd,
+        previousActualCostUsd,
+        unitCostUsd: (selection) => this.policies.profileFor(selection).cost.usd,
+      });
+      const results = await this.providers.withAccounting(accounting, () => this.dag.execute(compileId, nodes, request, signal));
+      yield emit('cost', 'cost-accounting', 0.945, 'Provider attempts accounted against the confirmed cap', {
+        estimatedCostUsd: estimate,
+        previousActualCostUsd,
+        reservedCostUsd: previousActualCostUsd + accounting.reservedCostUsd,
+        actualCostUsd: previousActualCostUsd + accounting.actualCostUsd,
+        maxCostUsd: request.maxCostUsd,
+        accountingBasis: 'reviewed-provider-unit-price',
+        providerAttempts: accounting.attempts.map(({ idempotencyKeyHash: _, ...attempt }) => ({ ...attempt, compileId })),
+      });
+      const progressByPhase: Record<string, number> = { requirements: 0.12, 'region-map': 0.24, terrain: 0.38, composition: 0.5, placement: 0.62, 'region-refinement': 0.76, 'visual-review': 0.86, optimization: 0.94 };
+      for (const result of results) if (result.status === 'completed') yield emit('progress', result.id, progressByPhase[result.id] ?? 0.5, `Completed ${result.id}`, { checkpointed: true });
+      const failed = results.find((result) => result.status === 'failed');
+      if (failed && request.qualityProfile === 'studio' && (failed.id === 'requirements' || failed.id === 'region-map' || failed.id === 'region-refinement' || failed.id === 'visual-review' || failed.id === 'optimization')) {
+        yield emit('needs-attention', failed.id, 1, failed.error ?? `Studio ${failed.id} requires operator attention`, { code: 'STUDIO_REFINEMENT_EXHAUSTED', rejectionReason: failed.error, plannedAction: failed.id === 'requirements' ? 'inspect generation attempts and resume with an explicit cost cap' : 'inspect review evidence and resume the typed repair DAG' });
+        return;
       }
+      const incomplete = results.find((result) => result.status !== 'completed');
+      if (incomplete) throw new Error(`Compile DAG ${incomplete.id} ${incomplete.status}: ${incomplete.error ?? 'unknown error'}`);
       const rawArtifact = results.find((result) => result.id === 'optimization')?.output as CompiledWorldArtifacts | undefined;
       if (!rawArtifact) throw new Error('Compiler optimization produced no canonical artifacts');
       const artifact: CompiledWorldArtifacts = { designSpec: WorldDesignSpecSchema.parse(rawArtifact.designSpec), authoringWorld: AuthoringWorldSchema.parse(rawArtifact.authoringWorld), bundle: assertValidBundle(rawArtifact.bundle) };

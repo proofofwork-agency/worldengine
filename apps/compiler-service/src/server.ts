@@ -11,8 +11,13 @@ import {
   WorldDesignSpecSchema,
   WorldPatchSchema,
   QualityCertificationSchema,
+  CompileArtifactCatalogSchema,
+  CompileReportSchema,
+  ResumeCompileRequestSchema,
   chunkId,
   type CompileEvent,
+  type GenerationArtifact,
+  type GenerationArtifactKind,
   type AuthoringWorld,
   type ProvenanceRecord,
   type ProviderTermsProfile,
@@ -21,6 +26,8 @@ import {
 } from '@worldengine/schema';
 import { applyCanonicalPatch, assertValidGlb, DeterministicWorldCompiler, FileArtifactCache, FileBinaryArtifactStore, FileWorldStorage, generateMeshLods, materializeDetailedChunkAsync, ProviderExecutionRegistry, ProviderPolicyRegistry, providerProfileOperationalIssues, referenceProviderProfiles, renderQualityReportHtml, transcodeGlbTexturesToKtx2, type BinaryArtifactStore, type StudioWorkerRegistry, type WorldStorage } from '@worldengine/compiler';
 import { JobLedger } from './ledger.js';
+
+type TerrainArtifactExtension = 'png' | 'ktx2' | 'f32' | 'bin';
 
 export interface CompilerServiceOptions {
   dataDirectory: string;
@@ -152,8 +159,10 @@ export async function persistStagedArtifacts(worldId: string, staged: unknown, b
     if (candidate.uri === `assets/${candidate.contentHash}.glb` && candidate.contentType === 'model/gltf-binary') await storage.putAsset(worldId, candidate.contentHash, bytes, candidate.contentType);
     else {
       const reference = candidate.uri.match(new RegExp(`^references/${candidate.contentHash}\\.(png|jpg|webp)$`));
-      if (!reference || !['image/png', 'image/jpeg', 'image/webp'].includes(candidate.contentType)) throw new Error(`Compiler emitted unsupported artifact URI ${candidate.uri}`);
-      await storage.putReference(worldId, candidate.contentHash, reference[1] as 'png' | 'jpg' | 'webp', bytes, candidate.contentType);
+      const terrain = candidate.uri.match(new RegExp(`^terrain/${candidate.contentHash}\\.(png|ktx2|f32|bin)$`));
+      if (reference && ['image/png', 'image/jpeg', 'image/webp'].includes(candidate.contentType)) await storage.putReference(worldId, candidate.contentHash, reference[1] as 'png' | 'jpg' | 'webp', bytes, candidate.contentType);
+      else if (terrain && (candidate.contentType === 'image/png' || candidate.contentType === 'image/ktx2' || candidate.contentType === 'application/octet-stream')) await storage.putTerrain(worldId, candidate.contentHash, terrain[1] as TerrainArtifactExtension, bytes, candidate.contentType);
+      else throw new Error(`Compiler emitted unsupported artifact URI ${candidate.uri}`);
     }
   }
 }
@@ -193,6 +202,55 @@ export async function startCompilerService(options: CompilerServiceOptions): Pro
   const allowedOrigins = new Set((options.allowedOrigins ?? []).map((origin) => new URL(origin).origin));
   let shuttingDown = false;
 
+  const artifactKind = (referenceKind: string | undefined, id: string): GenerationArtifactKind => {
+    if (referenceKind === 'terrain-reference') return 'terrain-rgb';
+    if (referenceKind === 'region-concept') return 'regional-composition';
+    if (referenceKind === 'object-mask') return 'object-mask';
+    if (referenceKind === 'object-crop') return 'object-crop';
+    if (referenceKind === 'object-isolated') return 'object-isolated';
+    if (referenceKind === 'object-diagnostic') return 'object-diagnostic';
+    if (referenceKind === 'placement-diagnostic') return 'placement-atlas';
+    if (referenceKind === 'blender-rgb') return 'blender-rgb';
+    if (referenceKind === 'blender-depth') return 'blender-depth';
+    if (referenceKind === 'blender-normal') return 'blender-normal';
+    if (referenceKind === 'blender-semantic') return 'blender-semantic';
+    if (referenceKind === 'blender-instance') return 'blender-instance';
+    if (referenceKind === 'object-multiview') {
+      if (id.includes('-left-')) return 'object-multiview-left';
+      if (id.includes('-back-')) return 'object-multiview-back';
+      if (id.includes('-right-')) return 'object-multiview-right';
+      return 'object-multiview-front';
+    }
+    return id.includes('refined') ? 'refined-glb' : 'raw-glb';
+  };
+
+  const captureArtifacts = (compileId: string, stagedInput: unknown, referencesInput: unknown, provenanceInput: unknown): void => {
+    const staged = Array.isArray(stagedInput) ? stagedInput : [];
+    const references = Array.isArray(referencesInput) ? referencesInput as Array<Record<string, unknown>> : [];
+    const provenance = Array.isArray(provenanceInput) ? provenanceInput as Array<Record<string, unknown>> : [];
+    staged.forEach((raw, index) => {
+      if (!raw || typeof raw !== 'object') return;
+      const value = raw as { contentHash?: unknown; contentType?: unknown; byteLength?: unknown; uri?: unknown; artifactKind?: unknown; phase?: unknown };
+      if (typeof value.contentHash !== 'string' || typeof value.contentType !== 'string' || typeof value.byteLength !== 'number') return;
+      const reference = references.find((candidate) => candidate['contentHash'] === value.contentHash);
+      const sourceId = typeof reference?.['id'] === 'string' ? reference['id'] : `binary-${index}-${value.contentHash.slice(0, 12)}`;
+      const kind = typeof value.artifactKind === 'string' ? value.artifactKind as GenerationArtifact['kind'] : artifactKind(typeof reference?.['kind'] === 'string' ? reference['kind'] : undefined, sourceId);
+      const provenanceRecord = provenance.find((candidate) => candidate['subjectId'] === sourceId);
+      const artifact: GenerationArtifact = {
+        id: `${kind}-${value.contentHash.slice(0, 16)}-${index}`, compileId, kind,
+        phase: typeof value.phase === 'string' ? value.phase : kind.startsWith('terrain-') ? 'terrain' : kind === 'regional-composition' ? 'composition' : kind.includes('multiview') ? 'multiview' : kind.includes('glb') ? 'reconstruction' : kind.startsWith('blender-') ? 'asset-validation' : kind === 'placement-atlas' ? 'placement' : 'segmentation',
+        uri: `/v1/compiles/${encodeURIComponent(compileId)}/artifacts/${kind}-${value.contentHash.slice(0, 16)}-${index}`,
+        contentHash: value.contentHash, contentType: value.contentType, byteLength: value.byteLength,
+        ...(typeof reference?.['regionId'] === 'string' ? { regionId: reference['regionId'] as never } : {}),
+        ...(typeof reference?.['prototypeId'] === 'string' ? { prototypeId: reference['prototypeId'] as never } : {}),
+        parentIds: Array.isArray(provenanceRecord?.['parentIds']) ? provenanceRecord['parentIds'] as string[] : [],
+        createdAt: typeof provenanceRecord?.['createdAt'] === 'string' ? provenanceRecord['createdAt'] : new Date().toISOString(),
+        metadata: { sourceUri: value.uri ?? null, referenceId: reference?.['id'] ?? null },
+      };
+      ledger.recordArtifact(artifact);
+    });
+  };
+
   const acquireWorldMutation = async (worldId: string): Promise<() => void> => {
     const previous = worldMutationTails.get(worldId) ?? Promise.resolve();
     let releaseCurrent!: () => void;
@@ -211,8 +269,9 @@ export async function startCompilerService(options: CompilerServiceOptions): Pro
     const controller = new AbortController();
     controllers.set(compileId, controller);
     const sequenceOffset = ledger.latestSequence(compileId) + 1;
+    const previousActualCostUsd = ledger.attempts(compileId).reduce((sum, attempt) => sum + attempt.actualCostUsd, 0);
     try {
-      for await (let event of compiler.compileWithSignal(request, compileId, controller.signal)) {
+      for await (let event of compiler.compileWithSignal(request, compileId, controller.signal, previousActualCostUsd)) {
         event = { ...event, sequence: event.sequence + sequenceOffset };
         if (shuttingDown && event.type === 'cancelled') break;
         if (event.type === 'artifact' && event.data['bundle'] && !request.dryRun) {
@@ -225,6 +284,7 @@ export async function startCompilerService(options: CompilerServiceOptions): Pro
           ledger.recordBundle(bundle);
           event = { ...event, data: { ...event.data, bundle, designSpec, authoringWorld } };
         }
+        if (event.type === 'artifact') captureArtifacts(compileId, event.data['binaryArtifacts'], (event.data['authoringWorld'] as Record<string, unknown> | undefined)?.['referenceImages'], (event.data['authoringWorld'] as Record<string, unknown> | undefined)?.['provenance']);
         ledger.appendEvent(event);
         eventBus.emit(compileId, event);
       }
@@ -233,7 +293,7 @@ export async function startCompilerService(options: CompilerServiceOptions): Pro
       // intentionally leaves the job recoverable for the next service start.
       if (!controller.signal.aborted && !shuttingDown) {
         const existing = ledger.events(compileId);
-        if (!existing.some((event) => ['completed', 'failed', 'cancelled'].includes(event.type))) {
+        if (!existing.some((event) => ['completed', 'failed', 'needs-attention', 'cancelled'].includes(event.type))) {
           const error = value instanceof Error ? value : new Error(String(value));
           const event: CompileEvent = {
             sequence: ledger.latestSequence(compileId) + 1,
@@ -250,6 +310,8 @@ export async function startCompilerService(options: CompilerServiceOptions): Pro
         }
       }
     } finally {
+      const preparation = ledger.nodeOutput<{ stagedArtifacts?: unknown; references?: unknown; referenceProvenance?: unknown }>(compileId, 'requirements');
+      if (preparation) captureArtifacts(compileId, preparation.stagedArtifacts, preparation.references, preparation.referenceProvenance);
       controllers.delete(compileId);
     }
   };
@@ -295,9 +357,12 @@ export async function startCompilerService(options: CompilerServiceOptions): Pro
           };
         });
         const providerReady = (provider: string) => providerStatuses.some((status) => status.provider.toLowerCase() === provider && status.operational && status.configured);
-        const cheapMissing = ['openrouter', 'openai', 'wavespeed'].filter((provider) => !providerReady(provider));
-        const studioMissing = ['openrouter', 'openai', 'sam2-local'].filter((provider) => !providerReady(provider));
-        if (!providerReady('tripo') && !providerReady('meshy')) studioMissing.push('tripo-or-meshy');
+        const imageProviderReady = providerReady('openrouter-image');
+        const cheapMissing = ['openrouter', 'wavespeed'].filter((provider) => !providerReady(provider));
+        if (!imageProviderReady) cheapMissing.push('openrouter-image');
+        const studioMissing = ['openrouter', 'sam2-local'].filter((provider) => !providerReady(provider));
+        if (!providerStatuses.some((status) => status.provider === 'openrouter-image' && status.modelId === 'openai/gpt-image-2' && status.operational && status.configured)) studioMissing.push('openrouter-openai-gpt-image-2');
+        if (!providerStatuses.some((status) => status.provider === 'wavespeed' && status.modelId === 'tripo3d/h3.1/multiview-to-3d' && status.operational && status.configured)) studioMissing.push('wavespeed-tripo-h3.1-multiview');
         if (!blender.available) studioMissing.push('blender');
         json(response, 200, {
           status: 'ok', service: 'worldengine-compiler', version: '0.1.0',
@@ -351,12 +416,53 @@ export async function startCompilerService(options: CompilerServiceOptions): Pro
         const compileId = decodeURIComponent(cancelRoute[1]!);
         const job = ledger.job(compileId);
         if (!job) { json(response, 404, { error: 'compile_not_found' }); return; }
-        if (['completed', 'failed', 'cancelled'].includes(job.status)) { json(response, 409, { error: 'compile_terminal', status: job.status }); return; }
+        if (['completed', 'failed', 'needs-attention', 'cancelled'].includes(job.status)) { json(response, 409, { error: 'compile_terminal', status: job.status }); return; }
         controllers.get(compileId)?.abort(new Error('Cancelled by operator'));
         const event: CompileEvent = { sequence: ledger.latestSequence(compileId) + 1, compileId, type: 'cancelled', phase: 'cancelled', progress: 1, message: 'Compile cancelled by operator', timestamp: new Date().toISOString(), data: {} };
         ledger.appendEvent(event);
         eventBus.emit(compileId, event);
         json(response, 202, { compileId, status: 'cancelled' });
+        return;
+      }
+      const artifactsRoute = routeMatch(url.pathname, /^\/v1\/compiles\/([^/]+)\/artifacts$/);
+      if (request.method === 'GET' && artifactsRoute) {
+        const compileId = decodeURIComponent(artifactsRoute[1]!);
+        const job = ledger.job(compileId);
+        if (!job) { json(response, 404, { error: 'compile_not_found' }); return; }
+        json(response, 200, CompileArtifactCatalogSchema.parse({ compileId, artifacts: ledger.artifacts(compileId), attempts: ledger.attempts(compileId), decisions: ledger.decisions(compileId), updatedAt: job.updatedAt }));
+        return;
+      }
+      const artifactRoute = routeMatch(url.pathname, /^\/v1\/compiles\/([^/]+)\/artifacts\/([^/]+)$/);
+      if (request.method === 'GET' && artifactRoute) {
+        const compileId = decodeURIComponent(artifactRoute[1]!); const artifactId = decodeURIComponent(artifactRoute[2]!);
+        const artifact = ledger.artifact(compileId, artifactId);
+        if (!artifact) { json(response, 404, { error: 'artifact_not_found' }); return; }
+        const bytes = await binaryArtifacts.get(artifact.contentHash);
+        if (bytes.byteLength !== artifact.byteLength || createHash('sha256').update(bytes).digest('hex') !== artifact.contentHash.toLowerCase()) throw new HttpError(409, 'Compile artifact failed integrity verification');
+        response.writeHead(200, { 'content-type': artifact.contentType, 'content-length': String(bytes.byteLength), etag: `"${artifact.contentHash}"`, 'cache-control': 'private, immutable, max-age=31536000' });
+        response.end(bytes);
+        return;
+      }
+      const reportRoute = routeMatch(url.pathname, /^\/v1\/compiles\/([^/]+)\/report$/);
+      if (request.method === 'GET' && reportRoute) {
+        const compileId = decodeURIComponent(reportRoute[1]!); const job = ledger.job(compileId);
+        if (!job) { json(response, 404, { error: 'compile_not_found' }); return; }
+        const events = ledger.events(compileId); const costEvent = [...events].reverse().find((event) => event.type === 'cost'); const terminal = events.at(-1);
+        const status = job.status === 'completed' ? 'published' : job.status === 'needs-attention' ? 'needs-attention' : job.status === 'failed' ? 'failed' : job.status === 'cancelled' ? 'cancelled' : 'in-progress';
+        const artifacts = ledger.artifacts(compileId); const attempts = ledger.attempts(compileId); const decision = ledger.decisions(compileId).at(-1);
+        json(response, 200, CompileReportSchema.parse({ schemaVersion: '1.0.0', compileId, status, qualityProfile: job.request.qualityProfile, cost: { reservedUsd: Number(costEvent?.data['reservedCostUsd'] ?? costEvent?.data['estimatedCostUsd'] ?? 0), actualUsd: attempts.reduce((sum, attempt) => sum + attempt.actualCostUsd, 0), capUsd: job.request.maxCostUsd }, providerRevisions: job.request.providerModels, artifactIds: artifacts.map((artifact) => artifact.id), attemptIds: attempts.map((attempt) => attempt.id), ...(status === 'needs-attention' || status === 'failed' ? { rejectionReason: terminal?.message ?? 'Compile requires attention' } : {}), ...(decision?.actions[0] ? { plannedAction: decision.actions[0] } : {}), createdAt: job.createdAt, updatedAt: job.updatedAt }));
+        return;
+      }
+      const resumeRoute = routeMatch(url.pathname, /^\/v1\/compiles\/([^/]+)\/resume$/);
+      if (request.method === 'POST' && resumeRoute) {
+        const compileId = decodeURIComponent(resumeRoute[1]!); const job = ledger.job(compileId);
+        if (!job) { json(response, 404, { error: 'compile_not_found' }); return; }
+        if (job.status !== 'needs-attention') { json(response, 409, { error: 'compile_not_resumable', status: job.status }); return; }
+        const resume = ResumeCompileRequestSchema.parse(await readJson(request));
+        if (resume.maxCostUsd <= job.request.maxCostUsd) throw new HttpError(400, 'Resume requires a new cost cap above the previous confirmed cap');
+        const resumed = CompileRequestSchema.parse({ ...job.request, maxCostUsd: resume.maxCostUsd, dryRun: false });
+        ledger.resetDag(compileId); ledger.resumeJob(compileId, resumed); launchCompile(compileId, resumed);
+        json(response, 202, { compileId, status: 'in-progress', events: `/v1/compiles/${compileId}/events` });
         return;
       }
       const eventsRoute = routeMatch(url.pathname, /^\/v1\/compiles\/([^/]+)\/events$/);
@@ -369,10 +475,10 @@ export async function startCompilerService(options: CompilerServiceOptions): Pro
         const history = ledger.events(compileId);
         const existing = history.filter((event) => !Number.isFinite(lastEventId) || event.sequence > lastEventId);
         existing.forEach(send);
-        if (history.some((event) => ['completed', 'failed', 'cancelled'].includes(event.type))) { response.end(); return; }
+        if (history.some((event) => ['completed', 'failed', 'needs-attention', 'cancelled'].includes(event.type))) { response.end(); return; }
         const listener = (event: CompileEvent) => {
           send(event);
-          if (['completed', 'failed', 'cancelled'].includes(event.type)) { eventBus.off(compileId, listener); response.end(); }
+          if (['completed', 'failed', 'needs-attention', 'cancelled'].includes(event.type)) { eventBus.off(compileId, listener); response.end(); }
         };
         eventBus.on(compileId, listener);
         request.on('close', () => eventBus.off(compileId, listener));
@@ -441,9 +547,9 @@ export async function startCompilerService(options: CompilerServiceOptions): Pro
         if (certification.certified && (certification.scenarios.length !== benchmarkScenarioIds.size || certification.scenarios.some((scenario) => !benchmarkScenarioIds.has(scenario.id)))) throw new HttpError(400, 'Certified reports require all five paper-derived scenarios');
         const requiredHardGates = new Set(['provider-policy', 'all-assets-reviewed', 'terrain-contact', 'free-viewpoint', 'runtime-performance', 'cost-cap', 'independent-raters']);
         if (certification.certified && [...requiredHardGates].some((id) => !certification.hardGates.some((gate) => gate.id === id && gate.passed))) throw new HttpError(400, 'Certified reports require every parity hard gate');
-        const requiredStudioEvidence = new Set(['region-concept', 'object-mask', 'object-multiview', 'blender-rgb', 'blender-depth', 'blender-normal', 'blender-instance', 'placement-diagnostic']);
+        const requiredStudioEvidence = new Set(['region-concept', 'object-mask', 'object-crop', 'object-multiview', 'blender-rgb', 'blender-depth', 'blender-normal', 'blender-semantic', 'blender-instance', 'placement-diagnostic']);
         if (certification.certified && [...requiredStudioEvidence].some((kind) => !authoringWorld.referenceImages.some((reference) => reference.kind === kind))) throw new HttpError(400, 'Certified reports require complete Studio image, mask, multiview, Blender-pass, and placement evidence');
-        if (certification.certified && !authoringWorld.terrain.edits.some((edit) => edit.mode === 'flatten' || edit.mode === 'smooth')) throw new HttpError(400, 'Certified reports require local terrain support co-deformation');
+        if (certification.certified && (authoringWorld.terrain.kind !== 'compiled-heightfield' || !authoringWorld.terrain.footprintEdits.some((edit) => edit.mode === 'flatten' || edit.mode === 'smooth'))) throw new HttpError(400, 'Certified reports require bounded mesh-footprint terrain support co-deformation');
         if (certification.certified && !authoringWorld.entities.some((entity) => entity.visualState['compositionDetected'] === true && entity.visualState['coDeformed'] === true)) throw new HttpError(400, 'Certified reports require detected composition placement with local co-deformation');
         if (certification.certified && authoringWorld.provenance.some((record) => (record.kind === 'generated' || record.kind === 'edited') && !record.reviewedAt)) throw new HttpError(400, 'Certified reports cannot contain unreviewed generated or edited provenance');
         for (const scenario of certification.scenarios) {
@@ -609,6 +715,13 @@ export async function startCompilerService(options: CompilerServiceOptions): Pro
         });
         response.end(bytes);
         return;
+      }
+      const terrainArtifactRoute = routeMatch(url.pathname, /^\/v1\/worlds\/([^/]+)\/terrain\/([a-f\d]{64})\.(png|ktx2|f32|bin)$/i);
+      if (request.method === 'GET' && terrainArtifactRoute) {
+        const extension = terrainArtifactRoute[3]!.toLowerCase() as TerrainArtifactExtension; const contentHash = terrainArtifactRoute[2]!.toLowerCase();
+        const bytes = await storage.getTerrain(decodeURIComponent(terrainArtifactRoute[1]!), contentHash, extension);
+        response.writeHead(200, { 'content-type': extension === 'png' ? 'image/png' : extension === 'ktx2' ? 'image/ktx2' : 'application/octet-stream', 'content-length': bytes.byteLength, 'cache-control': 'public, max-age=31536000, immutable', etag: `"${contentHash}"`, 'x-content-type-options': 'nosniff', 'access-control-allow-origin': '*' });
+        response.end(bytes); return;
       }
       const chunkPayloadRoute = routeMatch(url.pathname, /^\/v1\/worlds\/([^/]+)\/chunks\/(-?\d+)_(-?\d+)\.json$/);
       if (request.method === 'GET' && chunkPayloadRoute) {
